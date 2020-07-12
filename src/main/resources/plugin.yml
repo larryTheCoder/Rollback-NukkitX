@@ -1,6 +1,32 @@
 name: "${name}"
 version: "${version}"
-author: Empire92
+authors: ["larryTheCoder", "Empire92"]
 api: ["1.0.0"]
 main: com.boydti.rollback.Rollback
 depend: ["FastAsyncWorldEdit"]
+description: "Provides anti-grief protection for your servers."
+
+permissions:
+  # These are the defaults permissions
+  rollback.command:
+    description: "Main Rollback command permission."
+    default: true
+    children:
+      rollback.perform:
+        description: "Rollback all the last saved actions."
+        default: op
+      rollback.inspect:
+        description: "Inspect a certain block."
+        default: op
+      rollback.log:
+        description: "Logs all the actions in the world."
+        default: op
+      rollback.status:
+        description: "Show the status of the plugin uptime."
+        default: op
+      rollback.purge:
+        description: "Purge some specific data in database by time."
+        default: op
+      rollback.search:
+        description: "Search the block changes on specific area"
+        default: op

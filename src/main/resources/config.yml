@@ -1,0 +1,56 @@
+###########################################################################################
+# This is a YML file. Be careful when editing. Check your edits in a YAML checker like    #
+# the one at http://yaml-online-parser.appspot.com                                        #
+###########################################################################################
+---
+
+# Config version,
+# DO NOT CHANGE THIS.
+version: 1
+
+# Plugin main prefix
+prefix: "&7<&cRollback&7>&f "
+
+# Here you can change the wand
+# For you to inspect a block
+# Format: 'ID:META'
+wand-item: "347:0"
+
+# Delete all of the block data after
+# X days, this will keep the unnecessary
+# data removed. Saves memory and space.
+purge-days: 14
+
+# These are the things that will be logged
+# Set it to true to log them.
+loggers:
+  - tiles: true
+  - block-break: true
+  - block-place: true
+  - physics: true
+  - falling-block: true
+  - block-explosion: true
+
+## Database
+# Fully tested and works.
+database:
+  # A starting mainPrefix for the database
+  # This great to split of some databases
+  # From the mysql server
+  prefix: ""
+  # Configuration of DATABASE Connection:
+  #  Use mysql for the database, leave it
+  #  false if you want to shouldBeEnabled sqlite
+  use-mysql: false
+  SQLite:
+    # SQlite location
+    # You no need separator for this
+    # This separates the folder from database
+    # EX: 'world/{world-name}.db'
+    file-name: database
+  MySQL:
+    port: 3306
+    database: 'log_1'
+    username: 'root'
+    password: ''
+    host: 'localhost'

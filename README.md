@@ -1,4 +1,7 @@
-# WIP rollback for mcpe
+# WIP rollback for MCPE
+This plugin requires FastAsyncWorldEdit plugin in order to work correctly. Works for NukkitX
+API 1.0.11, MCPE 1.16.x
+
 ### Simple
  - This can log block breaking and placement (more events will be added later).
  - Quickly inspect blocks by left clicking with a clock (crouch to inspect the adjacent block)

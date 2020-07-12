@@ -1,33 +1,54 @@
+/*
+ * Rollback for Nukkit
+ *
+ * Copyright (C) 2017-2020 boy0001 and larryTheCoder
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package com.boydti.rollback.object;
 
-import java.util.HashMap;
-
 import cn.nukkit.block.Block;
-
+import cn.nukkit.math.Vector3;
 import com.boydti.fawe.FaweCache;
 import com.boydti.fawe.util.MathMan;
 import com.boydti.rollback.api.AbstractLogger;
 import com.sk89q.jnbt.CompoundTag;
 
+import java.util.HashMap;
+
 public class PhysicsTracker {
-    
+
     private final AbstractLogger logger;
-    private final PhysicsChange mutable = new PhysicsChange(null, 0, 0, 0, 0, null);
+
+    private final PhysicsChange mutable = new PhysicsChange(new Vector3());
     private final PhysicsChange[] pool;
+
     private int poolIndex = 0;
-    
-    public PhysicsTracker(AbstractLogger logger) {
-        this.logger = logger;
-        pool = new PhysicsChange[100000];
-        for (int i = 0; i < pool.length; i++) {
-            pool[i] = new PhysicsChange(null, 0, 0, 0);
-        }
-    }
-    
+
     // Store 2 ticks worth of physics changes + the current tick
     private HashMap<PhysicsChange, PhysicsChange> tick2Changes = new HashMap<>();
     private HashMap<PhysicsChange, PhysicsChange> tick1Changes = new HashMap<>();
     private HashMap<PhysicsChange, PhysicsChange> changes = new HashMap<>();
+
+    public PhysicsTracker(AbstractLogger logger) {
+        this.logger = logger;
+        pool = new PhysicsChange[100000];
+        for (int i = 0; i < pool.length; i++) {
+            pool[i] = new PhysicsChange(new Vector3());
+        }
+    }
 
     public void clear() {
         if (!changes.isEmpty() || !tick1Changes.isEmpty() || !tick2Changes.isEmpty()) {
@@ -37,179 +58,157 @@ public class PhysicsTracker {
         }
     }
 
-    public void store(String name, int x, int y, int z, int combinedId) {
-        PhysicsChange change = newChange(name, x, y, z, combinedId, null);
+    public void store(String name, Vector3 vec, int combinedId) {
+        PhysicsChange change = newChange(name, vec, combinedId, null);
         changes.put(change, change);
     }
 
-    public void storeRelative(String name, int x, int y, int z) {
-        if (y < 255) {
-            add(name, x, y + 1, z);
+    public void storeRelative(String name, Vector3 vec) {
+        if (vec.getFloorY() < 255) {
+            add(name, vec.add(0, 1));
         }
-        //        if (y > 0) {
-        //            add(name, x, y - 1, z);
-        //        }
-        add(name, x - 1, y, z);
-        add(name, x + 1, y, z);
-        
-        add(name, x, y, z - 1);
-        add(name, x, y, z + 1);
+
+        add(name, vec.add(-1));
+        add(name, vec.add(1));
+
+        add(name, vec.add(0, 0, -1));
+        add(name, vec.add(0, 0, 1));
     }
-    
-    public String getName(int x, int y, int z) {
-        mutable.set(x, y, z);
+
+    private String getName(Vector3 vec) {
+        mutable.set(vec);
         PhysicsChange change = tick2Changes.get(mutable);
         if (change != null) {
-            return change.name;
+            return change.getPlayerName();
         }
         change = tick1Changes.get(mutable);
         if (change != null) {
-            return change.name;
+            return change.getPlayerName();
         }
         change = changes.get(mutable);
         if (change != null) {
-            return change.name;
+            return change.getPlayerName();
         }
         return null;
     }
-    
-    private void add(String name, int x, int y, int z) {
-        mutable.set(x, y, z);
+
+    private void add(String name, Vector3 vec) {
+        mutable.set(vec);
         if (changes.containsKey(mutable)) {
             return;
         }
-        int combined = logger.getQueue().getCombinedId4Data(x, y, z);
+        int combined = logger.getQueue().getCombinedId4Data(vec.getFloorX(), vec.getFloorY(), vec.getFloorZ());
         if (combined == 0) {
             return;
         }
         CompoundTag nbt;
         if (FaweCache.hasNBT(FaweCache.getId(combined))) {
-            nbt = logger.getQueue().getTileEntity(x, y, z);
+            nbt = logger.getQueue().getTileEntity(vec.getFloorX(), vec.getFloorY(), vec.getFloorZ());
         } else {
             nbt = null;
         }
-        PhysicsChange change = newChange(name, x, y, z, combined, nbt);
+        PhysicsChange change = newChange(name, vec, combined, nbt);
         changes.put(change, change);
     }
 
-    public boolean logChange(Block block) {
-        boolean result = false;
+    public void logChange(Block block) {
         int x = block.getFloorX();
         int y = block.getFloorY();
         int z = block.getFloorZ();
         if (y < 255) {
-            result = logChange(x, y + 1, z) || result;
+            logChange(new Vector3(x, y + 1, z));
         }
-        result = logChange(x, y, z - 1) || result;
-        result = logChange(x, y, z + 1) || result;
-        result = logChange(x - 1, y, z) || result;
-        result = logChange(x + 1, y, z) || result;
-        result = logChange(x, y, z) || result;
-        return result;
+        logChange(new Vector3(x, y, z - 1));
+        logChange(new Vector3(x, y, z + 1));
+        logChange(new Vector3(x - 1, y, z));
+        logChange(new Vector3(x + 1, y, z));
+        logChange(new Vector3(x, y, z));
     }
-    
-    public String getNameRelative(int x, int y, int z) {
-        String name = getName(x + 1, y, z);
+
+    public String getNameRelative(Vector3 vec) {
+        String name = getName(vec.add(1));
         if (name != null) return name;
-        name = getName(x - 1, y, z);
+        name = getName(vec.add(-1));
         if (name != null) return name;
-        name = getName(x, y, z + 1);
+        name = getName(vec.add(0, 0, 1));
         if (name != null) return name;
-        name = getName(x, y, z - 1);
+        name = getName(vec.add(0, 0, -1));
         if (name != null) return name;
-        name = getName(x, y + 1, z);
+        name = getName(vec.add(0, 1, 0));
         return name;
     }
 
-    public boolean logChange(int x, int y, int z) {
-        mutable.set(x, y, z);
+    private void logChange(Vector3 vec) {
+        mutable.set(vec);
         PhysicsChange change = changes.get(mutable);
         if (change == null) {
-            return false;
+            return;
         }
-        int combinedTo = logger.getQueue().getCombinedId4Data(x, y, z);
+        int combinedTo = logger.getQueue().getCombinedId4Data(vec.getFloorX(), vec.getFloorY(), vec.getFloorZ());
         if (change.combinedId != combinedTo) {
             changes.remove(mutable);
-            logger.logBlock(change.name, x, y, z, (short) change.combinedId, (short) combinedTo, change.nbt, null);
-            storeRelative(change.name, x, y, z);
-            return true;
+            logger.logBlock(change.getPlayerName(), vec, (short) change.combinedId, (short) combinedTo, change.nbt, null);
+            storeRelative(change.getPlayerName(), vec);
         }
-        return false;
     }
-    
-    private PhysicsChange newChange(String name, int x, int y, int z, int combinedId, CompoundTag nbt) {
+
+    private PhysicsChange newChange(String name, Vector3 vec, int combinedId, CompoundTag nbt) {
         if (poolIndex == pool.length) {
             poolIndex = 0;
         }
         PhysicsChange value = pool[poolIndex++];
-        value.set(name, x, y, z, combinedId, nbt);
+        value.set(name, vec, combinedId, nbt);
         return value;
     }
-    
+
     private class PhysicsChange {
-        public int x;
-        public int y;
-        public int z;
-        public int combinedId;
-        public CompoundTag nbt;
-        public String name;
-        
-        public PhysicsChange(String name, int x, int y, int z) {
-            combinedId = logger.getQueue().getCombinedId4Data(x, y, z);
-            if (FaweCache.hasNBT(FaweCache.getId(combinedId))) {
-                nbt = logger.getQueue().getTileEntity(x, y, z);
+        private String playerName;
+        private int x;
+        private int y;
+        private int z;
+        private int combinedId;
+        private CompoundTag nbt;
+        private int hash;
+
+        PhysicsChange(Vector3 vec) {
+            if (logger != null) {
+                combinedId = logger.getQueue().getCombinedId4Data(vec.getFloorX(), vec.getFloorY(), vec.getFloorZ());
+                if (FaweCache.hasNBT(FaweCache.getId(combinedId))) {
+                    nbt = logger.getQueue().getTileEntity(x, y, z);
+                }
             }
-            this.name = name;
-            this.x = x;
-            this.y = y;
-            this.z = z;
+            this.playerName = null;
+            this.x = vec.getFloorX();
+            this.y = vec.getFloorY();
+            this.z = vec.getFloorZ();
         }
 
-        public PhysicsChange(String name, int x, int y, int z, int combinedId, CompoundTag nbt) {
-            this.name = name;
-            this.x = x;
-            this.y = y;
-            this.z = z;
-            this.combinedId = combinedId;
-            this.nbt = nbt;
-        }
-        
-        private int hash;
-        
-        public void set(int x, int y, int z) {
-            this.x = x;
-            this.y = y;
-            this.z = z;
+        void set(Vector3 vec) {
+            this.x = vec.getFloorX();
+            this.y = vec.getFloorY();
+            this.z = vec.getFloorZ();
             hash = 0;
         }
-        
-        public void set(String name, int x, int y, int z, int combinedId, CompoundTag nbt) {
-            this.x = x;
-            this.y = y;
-            this.z = z;
-            this.name = name;
+
+        void set(String playerName, Vector3 vec, int combinedId, CompoundTag nbt) {
+            this.x = vec.getFloorX();
+            this.y = vec.getFloorY();
+            this.z = vec.getFloorZ();
+            this.playerName = playerName;
             this.combinedId = combinedId;
             this.nbt = nbt;
             hash = 0;
         }
-        
-        public int getX() {
-            return x;
+
+        String getPlayerName() {
+            return playerName;
         }
-        
-        public int getY() {
-            return y;
-        }
-        
-        public int getZ() {
-            return z;
-        }
-        
+
         @Override
         public String toString() {
-            return (x + "," + y + "," + z);
+            return ("Player=" + playerName + "," + x + "," + y + "," + z);
         }
-        
+
         @Override
         public int hashCode() {
             if (hash == 0) {
@@ -218,9 +217,12 @@ public class PhysicsTracker {
             }
             return hash;
         }
-        
+
         @Override
         public boolean equals(Object obj) {
+            if (!(obj instanceof PhysicsChange)) {
+                return false;
+            }
             PhysicsChange other = (PhysicsChange) obj;
             return other.x == x && other.z == z && other.y == y;
         }

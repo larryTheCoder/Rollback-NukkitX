@@ -1,917 +1,1070 @@
+/*
+ * Rollback for Nukkit
+ *
+ * Copyright (C) 2017-2020 boy0001 and larryTheCoder
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package com.boydti.rollback.database;
 
-import com.boydti.fawe.config.Settings;
-import com.boydti.fawe.object.RunnableVal;
-import com.boydti.fawe.util.MathMan;
-import com.boydti.fawe.util.TaskManager;
+import cn.nukkit.Server;
+import cn.nukkit.math.Vector3;
 import com.boydti.rollback.api.AbstractLogger;
-import com.boydti.rollback.config.Config;
+import com.boydti.rollback.block.Block;
+import com.boydti.rollback.block.BlockChange;
+import com.boydti.rollback.block.SimpleBlockChange;
+import com.boydti.rollback.database.thread.DatabaseThread;
+import com.boydti.rollback.event.RollbackActionEvent;
+import com.boydti.rollback.util.MathMan;
+import com.boydti.rollback.util.Utils;
+import com.nimbusds.jose.util.ArrayUtils;
 import com.sk89q.jnbt.CompoundTag;
-import com.sk89q.jnbt.NBTInputStream;
-import com.sk89q.jnbt.NBTOutputStream;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.sql.Connection;
-import java.sql.DatabaseMetaData;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
+
+import java.sql.*;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
-import net.jpountz.lz4.LZ4Compressor;
-import net.jpountz.lz4.LZ4Factory;
-import net.jpountz.lz4.LZ4InputStream;
-import net.jpountz.lz4.LZ4SafeDecompressor;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
+import static com.boydti.rollback.util.Utils.*;
+
+@SuppressWarnings("SqlResolve")
 public abstract class SQLDatabase extends AbstractLogger {
-    
-    private final String prefix;
-    private Connection connection;
-    private final boolean mySql;
-    
-    private static LZ4Factory factory = LZ4Factory.fastestInstance();
-    private static LZ4Compressor compressor = factory.highCompressor(17);
 
-    public ConcurrentLinkedQueue<Runnable> notify = new ConcurrentLinkedQueue<>();
-    public ConcurrentLinkedQueue<BlockChange> blockChanges = new ConcurrentLinkedQueue<>();
+    public final int tablePartition = 8;
+    public final int timePartition = 4;
 
-    public final String INSERT_BLOCKNBT;
-    public final String INSERT_BLOCKFT;
-    public final String INSERT_BLOCKF;
-    public final String INSERT_BLOCKT;
-    public final String INSERT_CHUNK;
-    public final String INSERT_PLAYER;
-    
-    public final String GET_PLAYERS;
-    public final String GET_CHUNKS;
-    
-    public final String PURGE_BLOCKS;
-    public final String PURGE_BLOCKSF;
-    public final String PURGE_BLOCKST;
-    public final String PURGE_BLOCKSNBT;
-    
-    private final String UPDATE_TIME;
-    private final String UPDATE_TIME_BLOCKS;
-    private final String UPDATE_TIME_BLOCKSF;
-    private final String UPDATE_TIME_BLOCKST;
-    private final String UPDATE_TIME_BLOCKSNBT;
-
-    public final String GET_BLOCKNBT_POS;
-    public final String GET_BLOCKFT_POS;
-    public final String GET_BLOCKF_POS;
-    public final String GET_BLOCKT_POS;
-    public final String GET_BLOCKNBT_VARCHAR_TIME;
-    public final String GET_BLOCKFT_VARCHAR_TIME;
-    public final String GET_BLOCKF_VARCHAR_TIME;
-    public final String GET_BLOCKT_VARCHAR_TIME;
-    
-    public final int TABLE_PARTITION = 8;
-    public final int TIME_PARTITION = 0;
-
-    private final HashMap<Long, Integer> CHUNK_LOC_ID = new HashMap<>();
-    private final HashMap<String, Short> PLAYER_VARCHAR_ID = new HashMap<>();
-    
-    private final HashMap<Integer, Long> CHUNK_ID_LOC = new HashMap<>();
-    private final HashMap<Short, String> PLAYER_ID_VARCHAR = new HashMap<>();
-    
     // From table
-    private long BASE_TIME;
-    
-    public SQLDatabase(final String world, String prefix, boolean mySql) {
-        super(world);
-        this.prefix = (prefix = prefix + world);
-        this.mySql = mySql;
-        INSERT_BLOCKNBT = "INSERT INTO `" + prefix + "blocksnbt$` (`player`,`chunk`,`pos`,`change`,`time`,`nbtf`,`nbtt`) VALUES(?,?,?,?,?,?,?)";
-        INSERT_BLOCKFT = "INSERT INTO `" + prefix + "blocks$` (`player`,`chunk`,`pos`,`change`,`time`) VALUES(?,?,?,?,?)";
-        INSERT_BLOCKF = "INSERT INTO `" + prefix + "blocksf$` (`player`,`chunk`,`pos`,`change`,`time`) VALUES(?,?,?,?,?)";
-        INSERT_BLOCKT = "INSERT INTO `" + prefix + "blockst$` (`player`,`chunk`,`pos`,`change`,`time`) VALUES(?,?,?,?,?)";
-        
-        INSERT_CHUNK = "INSERT INTO `" + prefix + "chunks` (`x`,`z`) VALUES(?,?)";
-        INSERT_PLAYER = "INSERT INTO `" + prefix + "players` (`name`) VALUES(?)";
-        
-        GET_PLAYERS = "SELECT `id`,`name` FROM `" + prefix + "players`";
-        GET_CHUNKS = "SELECT `id`,`x`,`z` FROM `" + prefix + "chunks`";
-        
-        GET_BLOCKFT_POS = "SELECT `player`,`change`,`time` FROM `" + prefix + "blocks$` WHERE `chunk`=? AND `pos`=?";
-        GET_BLOCKF_POS = "SELECT `player`,`change`,`time` FROM `" + prefix + "blocksf$` WHERE `chunk`=? AND `pos`=?";
-        GET_BLOCKT_POS = "SELECT `player`,`change`,`time` FROM `" + prefix + "blockst$` WHERE `chunk`=? AND `pos`=?";
-        GET_BLOCKNBT_POS = "SELECT `player`,`change`,`time`,`nbtf`,`nbtt` FROM `" + prefix + "blocksnbt$` WHERE `chunk`=? AND `pos`=?";
-        
-        UPDATE_TIME = "UPDATE `" + prefix + "timestamp` SET `time`=?";
-        UPDATE_TIME_BLOCKS = "UPDATE `" + prefix + "blocks$` SET time=time-?";
-        UPDATE_TIME_BLOCKSF = "UPDATE `" + prefix + "blocks$` SET time=time-?";
-        UPDATE_TIME_BLOCKST = "UPDATE `" + prefix + "blocks$` SET time=time-?";
-        UPDATE_TIME_BLOCKSNBT = "UPDATE `" + prefix + "blocks$` SET time=time-?";
+    public final boolean useServer;
+    public final String mainPrefix;
 
-        GET_BLOCKNBT_VARCHAR_TIME = "SELECT `chunk`,`pos`,`change`,`time`,`nbtf`,`nbtt` FROM `" + prefix + "blocksnbt$` WHERE `player`=? AND `time`>=?";
-        GET_BLOCKFT_VARCHAR_TIME = "SELECT `chunk`,`pos`,`change`,`time` FROM `" + prefix + "blocks$` WHERE `player`=? AND `time`>=?";
-        GET_BLOCKF_VARCHAR_TIME = "SELECT `chunk`,`pos`,`change`,`time` FROM `" + prefix + "blocksf$` WHERE `player`=? AND `time`>=?";
-        GET_BLOCKT_VARCHAR_TIME = "SELECT `chunk`,`pos`,`change`,`time` FROM `" + prefix + "blockst$` WHERE `player`=? AND `time`>=?";
-        
-        PURGE_BLOCKS = "DELETE FROM `" + prefix + "blocks$` WHERE `time`<?";
-        PURGE_BLOCKSF = "DELETE FROM `" + prefix + "blocksf$` WHERE `time`<?";
-        PURGE_BLOCKST = "DELETE FROM `" + prefix + "blockst$` WHERE `time`<?";
-        PURGE_BLOCKSNBT = "DELETE FROM `" + prefix + "blocksnbt$` WHERE `time`<?";
+    // Table commands and execution
+    private final String
+            INSERT_BLOCKNBT,
+            INSERT_BLOCKFT,
+            INSERT_BLOCKF,
+            INSERT_BLOCKT,
+            INSERT_CHUNK,
+            INSERT_PLAYER,
+            GET_PLAYERS,
+            GET_CHUNKS,
+            GET_BLOCKNBT_POS,
+            GET_BLOCKFT_POS,
+            GET_BLOCKF_POS,
+            GET_BLOCKT_POS,
+            GET_BLOCKNBT_VARCHAR_TIME,
+            GET_BLOCKFT_VARCHAR_TIME,
+            GET_BLOCKF_VARCHAR_TIME,
+            GET_BLOCKT_VARCHAR_TIME,
+            GET_BLOCKNBT_TIME,
+            GET_BLOCKFT_TIME,
+            GET_BLOCKF_TIME,
+            GET_BLOCKT_TIME;
+
+    // Base time from the database
+    public long baseTime;
+
+    // Concurrency control.
+    private final ConcurrentLinkedQueue<BlockChange> blockChange = new ConcurrentLinkedQueue<>();
+
+    // These cannot initiate as static methods
+    public final Map<Long, Integer> chunkLocId = new ConcurrentHashMap<>();
+    public final Map<Integer, Long> chunkIdLoc = new ConcurrentHashMap<>();
+    public final Map<String, Short> playerVarcharId = new ConcurrentHashMap<>();
+    public final Map<Short, String> playerIdVarchar = new ConcurrentHashMap<>();
+
+    // In order to avoid the common "race-condition"
+    private final AtomicLong currentPingedConnection = new AtomicLong();
+    private final AtomicLong lastPingedConnection = new AtomicLong();
+    private final AtomicInteger lastBatchSize = new AtomicInteger();
+
+    // Purge and stuff
+    private final int purgeDays;
+
+    // Thread for the database operations alike
+    private DatabaseThread databaseThread;
+
+    protected SQLDatabase(String worldName, String prefix, boolean mySql) {
+        super(worldName);
+        mainPrefix = (prefix + worldName);
+        useServer = mySql;
+        purgeDays = com.boydti.rollback.Rollback.get().getConfig().getInt("purge-days", 15);
+
+        // Block data
+        INSERT_BLOCKNBT = "INSERT INTO `" + mainPrefix + "blocksnbt$`   (`player`,`chunk`,`pos`,`change`,`time`,`nbtf`,`nbtt`, `reverted`)  VALUES(?,?,?,?,?,?,?,?)";
+        INSERT_BLOCKFT = "INSERT INTO `" + mainPrefix + "blocks$`      (`player`,`chunk`,`pos`,`change`,`time`, `reverted`)                VALUES(?,?,?,?,?,?)";
+        INSERT_BLOCKF = "INSERT INTO `" + mainPrefix + "blocksf$`     (`player`,`chunk`,`pos`,`change`,`time`, `reverted`)                VALUES(?,?,?,?,?,?)";
+        INSERT_BLOCKT = "INSERT INTO `" + mainPrefix + "blockst$`     (`player`,`chunk`,`pos`,`change`,`time`, `reverted`)                VALUES(?,?,?,?,?,?)";
+
+        // Chunk data and player (insert)
+        INSERT_CHUNK = "INSERT INTO `" + mainPrefix + "chunks` (`x`,`z`) VALUES(?,?)";
+        INSERT_PLAYER = "INSERT INTO `" + mainPrefix + "players` (`name`) VALUES(?)";
+
+        // Chunk data and player (select)
+        GET_PLAYERS = "SELECT `id`,`name` FROM `" + mainPrefix + "players`";
+        GET_CHUNKS = "SELECT `id`,`x`,`z` FROM `" + mainPrefix + "chunks`";
+
+        // Get block data (select)
+        GET_BLOCKFT_POS = "SELECT `player`,`change`,`time`,`reverted`,`timeReverted`                   FROM `" + mainPrefix + "blocks$` WHERE `chunk`=? AND `pos`=?";
+        GET_BLOCKF_POS = "SELECT `player`,`change`,`time`,`reverted`,`timeReverted`                   FROM `" + mainPrefix + "blocksf$` WHERE `chunk`=? AND `pos`=?";
+        GET_BLOCKT_POS = "SELECT `player`,`change`,`time`,`reverted`,`timeReverted`                   FROM `" + mainPrefix + "blockst$` WHERE `chunk`=? AND `pos`=?";
+        GET_BLOCKNBT_POS = "SELECT `player`,`change`,`time`,`nbtf`,`nbtt`,`reverted`,`timeReverted`     FROM `" + mainPrefix + "blocksnbt$` WHERE `chunk`=? AND `pos`=?";
+
+        // Get block data by player and time (select)
+        GET_BLOCKNBT_VARCHAR_TIME = "SELECT `chunk`,`pos`,`change`,`time`,`nbtf`,`nbtt`,`reverted`,`player`,`timeReverted` FROM `" + mainPrefix + "blocksnbt$` WHERE `player`=? AND `time`>=?";
+        GET_BLOCKFT_VARCHAR_TIME = "SELECT `chunk`,`pos`,`change`,`time`,              `reverted`,`player`,`timeReverted` FROM `" + mainPrefix + "blocks$`    WHERE `player`=? AND `time`>=?";
+        GET_BLOCKF_VARCHAR_TIME = "SELECT `chunk`,`pos`,`change`,`time`,              `reverted`,`player`,`timeReverted` FROM `" + mainPrefix + "blocksf$`   WHERE `player`=? AND `time`>=?";
+        GET_BLOCKT_VARCHAR_TIME = "SELECT `chunk`,`pos`,`change`,`time`,              `reverted`,`player`,`timeReverted` FROM `" + mainPrefix + "blockst$`   WHERE `player`=? AND `time`>=?";
+
+        // Get block data by time (select)
+        GET_BLOCKNBT_TIME = "SELECT `chunk`,`pos`,`change`,`time`,`nbtf`,`nbtt`,`reverted`,`player`,`timeReverted` FROM `" + mainPrefix + "blocksnbt$` WHERE `time`>=?";
+        GET_BLOCKFT_TIME = "SELECT `chunk`,`pos`,`change`,`time`,              `reverted`,`player`,`timeReverted` FROM `" + mainPrefix + "blocks$`    WHERE `time`>=?";
+        GET_BLOCKF_TIME = "SELECT `chunk`,`pos`,`change`,`time`,              `reverted`,`player`,`timeReverted` FROM `" + mainPrefix + "blocksf$`   WHERE `time`>=?";
+        GET_BLOCKT_TIME = "SELECT `chunk`,`pos`,`change`,`time`,              `reverted`,`player`,`timeReverted` FROM `" + mainPrefix + "blockst$`   WHERE `time`>=?";
     }
-    
-    public byte[] toBytes(CompoundTag tag) {
-        if (tag == null) {
-            return null;
-        }
+
+    @Override
+    public void addRevert(String playerName, Vector3 vec, int timeDiff) {
+        throw new RuntimeException("Reverting blocks changes are currently not supported by default");
+    }
+
+    @Override
+    public void logBlock(String playerName, Vector3 vec, short combinedFrom, short combinedTo, CompoundTag nbtFrom, CompoundTag nbtTo) {
+        BlockChange change = (BlockChange) new BlockChange(this, vec)
+                .setChangeTime((int) ((int) (System.currentTimeMillis() >> timePartition) - baseTime))
+                .setBlockCombined(combinedFrom, combinedTo)
+                .setReverted(false, 0)
+                .setNBTData(nbtFrom, nbtTo)
+                .setPlayerName(playerName);
+
+        blockChange.add(change);
+        databaseThread.notifyThread();
+
+        RollbackActionEvent actionEvent = new RollbackActionEvent(Server.getInstance().getPlayer(playerName), change);
+        Server.getInstance().getPluginManager().callEvent(actionEvent);
+    }
+
+    @SuppressWarnings("SqlResolve")
+    protected void init() {
         try {
-            try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
-                try (NBTOutputStream stream = new NBTOutputStream(baos)) {
-                    stream.writeNamedTag("1", tag);
-                    return compress(baos.toByteArray());
+            openConnection();
+            DatabaseMetaData dbm = getConnection().getMetaData();
+            Statement stmt = getConnection().createStatement();
+
+            ResultSet tables = dbm.getTables(null, null, mainPrefix + "timestamp", null);
+            if (tables.next()) {
+                // Table exists
+                ResultSet r = stmt.executeQuery("SELECT `time` from `" + mainPrefix + "timestamp`");
+                if (!r.isClosed() && r.next()) {
+                    baseTime = r.getLong(1);
                 }
-            }
-        } catch (Exception ignore) {
-            ignore.printStackTrace();
-        }
-        return null;
-    }
-    
-    public static byte[] compress(byte[] src) {
-        int maxCompressedLength = compressor.maxCompressedLength(src.length);
-        byte[] compressed = new byte[maxCompressedLength];
-        int compressLen = compressor.compress(src, 0, src.length, compressed, 0, maxCompressedLength);
-        byte[] finalCompressedArray = Arrays.copyOf(compressed, compressLen);
-        return finalCompressedArray;
-    }
-    
-    private final byte[] buffer = new byte[Settings.HISTORY.BUFFER_SIZE];
-    
-    public CompoundTag toTag(byte[] compressed) {
-        if (compressed == null) {
-            return null;
-        }
-        try {
-            LZ4SafeDecompressor decompressor = factory.safeDecompressor();
-            int decompressedLength = decompressor.decompress(compressed, 0, compressed.length, buffer, 0);
-            byte[] copy = new byte[decompressedLength];
-            System.arraycopy(buffer, 0, copy, 0, decompressedLength);
-            try (NBTInputStream nbt = new NBTInputStream(new ByteArrayInputStream(copy))) {
-                CompoundTag value = (CompoundTag) nbt.readNamedTag().getTag();
-                return value;
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        return null;
-    }
 
-    public static byte[] decompress(byte[] src) {
-        try {
-            try (LZ4InputStream lz4 = new LZ4InputStream(new ByteArrayInputStream(src))) {
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                int i;
-                while ((i = lz4.read()) != -1) {
-                    baos.write(i);
+            } else {
+                baseTime = (System.currentTimeMillis() >> timePartition);
+                if (useServer) {
+                    stmt.executeUpdate("SET GLOBAL innodb_file_per_table=1");
+                    stmt.executeUpdate("SET GLOBAL innodb_file_format=Barracuda");
+                    stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "players` (`id` MEDIUMINT NOT NULL AUTO_INCREMENT, `name` VARCHAR(16) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8 AUTO_INCREMENT=1 ROW_FORMAT=COMPRESSED");
+                    stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "chunks` (`id` MEDIUMINT NOT NULL AUTO_INCREMENT, `x` INT NOT NULL, `z` INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8 AUTO_INCREMENT=1 ROW_FORMAT=COMPRESSED");
+                    stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "timestamp` (`time` BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8");
+                } else {
+                    stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "players` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `name` VARCHAR(16) NOT NULL)");
+                    stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "chunks` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `x` INT NOT NULL, `z` INT NOT NULL)");
+                    stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "timestamp` (`time` INTEGER NOT NULL)");
                 }
-                return baos.toByteArray();
+                stmt.addBatch("INSERT INTO `" + mainPrefix + "timestamp` (`time`) VALUES(" + baseTime + ")");
+                stmt.executeBatch();
+                stmt.clearBatch();
             }
-        } catch (IOException e) {
-            e.printStackTrace();
+            stmt.close();
+            stmt = getConnection().createStatement();
+
+            ResultSet set1 = stmt.executeQuery(GET_CHUNKS);
+
+            while (set1.next()) {
+                long pair = MathMan.pairInt(set1.getInt(2), set1.getInt(3));
+                chunkLocId.put(pair, set1.getInt(1));
+                chunkIdLoc.put(set1.getInt(1), pair);
+            }
+            stmt.close();
+            set1.close();
+            stmt = getConnection().createStatement();
+            set1 = stmt.executeQuery(GET_PLAYERS);
+
+            while (set1.next()) {
+                short id = (short) (set1.getShort(1) + Short.MIN_VALUE);
+                String name = set1.getString(2);
+                playerIdVarchar.put(id, name);
+                playerVarcharId.put(name, id);
+            }
+            set1.close();
+            stmt.close();
+
+            createThreads();
+        } catch (SQLException e) {
+            printSQLException(e);
+        } catch (ClassNotFoundException e) {
+            Utils.logError("An unexpected error just occurred.", e);
         }
-        return null;
     }
 
-    private class BlockChange {
-        private final String name;
-        private final int z;
-        private final int y;
-        private final int x;
-        private final short from;
-        private final short to;
-        private final int time;
-        private final CompoundTag nbtFrom;
-        private final CompoundTag nbtTo;
-        
-        private short playerId = Short.MAX_VALUE;
-        private int chunkId = Integer.MAX_VALUE;
+    public void addTask(Runnable run) {
+        super.addTask(run);
 
-        public BlockChange(String name, int x, int y, int z, short combinedFrom, short combinedTo, CompoundTag nbtFrom, CompoundTag nbtTo) {
-            this.name = name;
-            this.x = x;
-            this.y = y;
-            this.z = z;
-            this.from = combinedFrom;
-            this.to = combinedTo;
-            this.nbtFrom = nbtFrom;
-            this.nbtTo = nbtTo;
-            this.time = (int) ((System.currentTimeMillis() >> TIME_PARTITION) - BASE_TIME);
-        }
-        
-        public int getTime() {
-            return time;
-        }
-        
-        public boolean hasNBT() {
-            return nbtFrom != null || nbtTo != null;
-        }
-        
-        public byte[] getNbtTo() {
-            return toBytes(nbtTo);
-        }
-        
-        public byte[] getNbtFrom() {
-            return toBytes(nbtFrom);
-        }
+        databaseThread.notifyThread();
+    }
 
-        public boolean hasPlayerId() {
-            Short id1 = PLAYER_VARCHAR_ID.get(name);
-            if (id1 != null) {
-                playerId = id1;
-            }
-            return playerId != Short.MAX_VALUE;
-        }
+    public void createThreads() {
+        databaseThread = new DatabaseThread(this);
+        databaseThread.start();
+    }
 
-        public short getPlayerId() {
-            return playerId;
-        }
-        
-        public boolean hasChunkId() {
-            long pair = MathMan.pairInt(x >> 4, z >> 4);
-            Integer id2 = CHUNK_LOC_ID.get(pair);
-            if (id2 != null) {
-                chunkId = id2;
-            }
-            return chunkId != Integer.MAX_VALUE;
-        }
-        
-        public int getChunkId() {
-            return chunkId;
-        }
-        
-        public int getTableId() {
-            return chunkId >> TABLE_PARTITION;
-        }
-        
-        public byte getReducedChunkId() {
-            return (byte) (chunkId & ((1 << TABLE_PARTITION) - 1));
-        }
-        
-        public int createChunkId(PreparedStatement stmt) throws SQLException {
-            long pair = MathMan.pairInt(x >> 4, z >> 4);
-            stmt.setInt(1, x >> 4);
-            stmt.setInt(2, z >> 4);
-            stmt.executeUpdate();
-            ResultSet keys = stmt.getGeneratedKeys();
-            if (keys.next()) {
-                chunkId = keys.getInt(1);
-                int table = chunkId >> TABLE_PARTITION;
-                if ((chunkId & ((1 << TABLE_PARTITION) - 1)) == 0 || CHUNK_ID_LOC.size() == 0) {
-                    try (Statement create = connection.createStatement()) {
-                        if (mySql) {
-                            create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "blocks" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` INT NOT NULL, `time` INT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPRESSED");
-                            create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "blocksf" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT  NOT NULL, `time` INT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPRESSED");
-                            create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "blockst" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `time` INT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPRESSED");
-                            create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "blocksnbt" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `nbtf` BLOB, `nbtt` BLOB, `time` INT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPRESSED");
-                        } else {
-                            create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "blocks" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` INT NOT NULL, `time` INT NOT NULL)");
-                            create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "blocksf" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `time` INT NOT NULL)");
-                            create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "blockst" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `time` INT NOT NULL)");
-                            create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "blocksnbt" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `nbtf` BLOB, `nbtt` BLOB, `time` INT NOT NULL)");
-                        }
+    public boolean sendBatch() {
+        PreparedStatement[] blockFtStats;
+        PreparedStatement[] blockFStats;
+        PreparedStatement[] blockTStats;
+        PreparedStatement[] blockNbtStats;
+        try {
+            runTasks();
+            commit(false);
+
+            int size;
+            lastBatchSize.set(size = Math.min(0xfffff, blockChange.size()));
+
+            if (size == 0) return false;
+
+            long millis = -1;
+            lastPingedConnection.set(millis);
+            currentPingedConnection.set(millis = System.currentTimeMillis());
+
+            BlockChange[] copy = new BlockChange[size];
+            for (int i = 0; i < size; i++) copy[i] = blockChange.poll();
+
+            PreparedStatement playerStmt = null;
+            for (BlockChange change : copy) {
+                if (change.emptyPlayerId()) {
+                    if (playerStmt == null) {
+                        playerStmt = getConnection().prepareStatement(INSERT_PLAYER, Statement.RETURN_GENERATED_KEYS);
                     }
+
+                    createPlayerId(playerStmt, change);
+                    change.checkRequiredData();
                 }
-                CHUNK_ID_LOC.put(chunkId, pair);
-                CHUNK_LOC_ID.put(pair, chunkId);
-                return chunkId;
             }
-            return Integer.MAX_VALUE;
-        }
-        
-        public int createPlayerId(PreparedStatement stmt) throws SQLException {
-            stmt.setString(1, name);
-            stmt.executeUpdate();
-            ResultSet keys = stmt.getGeneratedKeys();
-            if (keys.next()) {
-                playerId = (short) (keys.getShort(1) + Short.MIN_VALUE);
-                PLAYER_ID_VARCHAR.put(playerId, name);
-                PLAYER_VARCHAR_ID.put(name, playerId);
-                return playerId;
+            if (playerStmt != null) playerStmt.close();
+
+            int minTable = Integer.MAX_VALUE;
+            int maxTable = 0;
+
+            PreparedStatement chunkStmt = null;
+            for (BlockChange change : copy) {
+                if (change.emptyChunkId()) {
+                    if (chunkStmt == null) {
+                        chunkStmt = getConnection().prepareStatement(INSERT_CHUNK, Statement.RETURN_GENERATED_KEYS);
+                    }
+
+                    createChunkId(chunkStmt, change);
+                    change.checkRequiredData();
+                }
+
+                int table = change.getTableId();
+                if (table < minTable) minTable = table;
+                if (table > maxTable) maxTable = table;
             }
-            return Integer.MAX_VALUE;
+            if (chunkStmt != null) chunkStmt.close();
+
+            blockFtStats = new PreparedStatement[maxTable - minTable + 1];
+            blockFStats = new PreparedStatement[maxTable - minTable + 1];
+            blockTStats = new PreparedStatement[maxTable - minTable + 1];
+            blockNbtStats = new PreparedStatement[maxTable - minTable + 1];
+
+            for (BlockChange change : copy) {
+                int table = change.getChunkId() >> tablePartition;
+                int stmtIndex = table - minTable;
+
+                PreparedStatement blockStmt;
+                // Creates a new block change
+                if (change.hasNBT()) {
+                    blockStmt = blockNbtStats[stmtIndex];
+                    if (blockStmt == null) {
+                        blockStmt = blockNbtStats[stmtIndex] = getConnection().prepareStatement(INSERT_BLOCKNBT.replace("$", table + ""));
+                    }
+                    blockStmt.setInt(4, change.getChangePair());
+                    blockStmt.setBytes(6, Utils.toBytes(change.getTileFrom()));
+                    blockStmt.setBytes(7, Utils.toBytes(change.getTileTo()));
+                    blockStmt.setBoolean(8, false);
+                } else if (change.getBlockTo() == 0) {
+                    blockStmt = blockFStats[stmtIndex];
+                    if (blockStmt == null) {
+                        blockStmt = blockFStats[stmtIndex] = getConnection().prepareStatement(INSERT_BLOCKF.replace("$", table + ""));
+                    }
+                    blockStmt.setShort(4, change.getBlockFrom());
+                    blockStmt.setBoolean(6, false);
+                } else if (change.getBlockFrom() == 0) {
+                    blockStmt = blockTStats[stmtIndex];
+                    if (blockStmt == null) {
+                        blockStmt = blockTStats[stmtIndex] = getConnection().prepareStatement(INSERT_BLOCKT.replace("$", table + ""));
+                    }
+                    blockStmt.setShort(4, change.getBlockTo());
+                    blockStmt.setBoolean(6, false);
+                } else {
+                    blockStmt = blockFtStats[stmtIndex];
+                    if (blockStmt == null) {
+                        blockStmt = blockFtStats[stmtIndex] = getConnection().prepareStatement(INSERT_BLOCKFT.replace("$", table + ""));
+                    }
+                    blockStmt.setInt(4, change.getChangePair());
+                    blockStmt.setBoolean(6, false);
+                }
+
+                blockStmt.setShort(1, change.getPlayerId());
+                blockStmt.setByte(2, change.getReducedChunkId());
+                blockStmt.setShort(3, getVectorPair(change));
+                blockStmt.setInt(5, change.getTimeChanged());
+                blockStmt.addBatch();
+            }
+
+            PreparedStatement[] res = ArrayUtils.concat(blockFtStats, blockFtStats, blockFStats, blockTStats);
+            for (PreparedStatement blockStmt : res) {
+                if (blockStmt != null) {
+                    blockStmt.executeBatch();
+                    blockStmt.close();
+                }
+            }
+
+            // TODO: Revert blocks.
+            // Note: During development of Rollback, I wasn't so sure about what is "race condition",
+            //       concurrency, and thread-alike operations. Now, I as much understand the consequences of
+            //       creating a code that are not "thread-safe" and perhaps crash in which makes me realise... Rewrite are needed.
+
+            lastPingedConnection.set(System.currentTimeMillis() - millis);
+
+            commit();
+            return true;
+        } catch (final SQLException e) {
+            printSQLException(e);
         }
-        
-        // `player`,`chunk`,`pos`,`change`,`time`
-        
-        public short getPos() {
-            return (short) ((MathMan.pair16((byte) (x & 15), (byte) (z & 15)) & 255) + (y << 8));
-        }
-        
-        public short getFrom() {
-            return from;
-        }
-        
-        public short getTo() {
-            return to;
-        }
-        
-        public int getChangePair() {
-            return (from << 16) | (to & 0xFFFF);
-        }
+
+        return false;
     }
 
+    public void purge() {
+        purge((int) TimeUnit.DAYS.toMillis(purgeDays));
+    }
+
+    /**
+     * Purges all the data inside the sql database
+     * This releases all the stress in the server to
+     * queries all the data of the block
+     *
+     * @param diff In milliseconds, the time that need to be deleted
+     *             BEFORE 'diff' time
+     */
     public void purge(int diff) {
-        long now = System.currentTimeMillis() - (BASE_TIME << TIME_PARTITION);
+        long now = System.currentTimeMillis() - (baseTime << timePartition);
         long then = System.currentTimeMillis() - diff;
         int deleteAfter = (int) (now - diff);
         if (deleteAfter < 0) {
             return;
         }
-        long shift = deleteAfter >> TIME_PARTITION;
+        long shift = deleteAfter >> timePartition;
+
         Set<Integer> tables = new HashSet<>();
-        for (Entry<Long, Integer> entry : CHUNK_LOC_ID.entrySet()) {
+        for (Entry<Long, Integer> entry : chunkLocId.entrySet()) {
             Integer chunkId = entry.getValue();
-            tables.add(chunkId >> TABLE_PARTITION);
+            tables.add(chunkId >> tablePartition);
         }
-        int i = 0;
-        int size = tables.size();
+
         for (int table : tables) {
-            System.out.println("DELETE " + table);
             try {
-                try (PreparedStatement stmt = connection.prepareStatement(PURGE_BLOCKS.replace("$", table + ""))) {
-                    stmt.setInt(1, deleteAfter);
-                    stmt.executeUpdate();
-                }
-                try (PreparedStatement stmt = connection.prepareStatement(PURGE_BLOCKSF.replace("$", table + ""))) {
-                    stmt.setInt(1, deleteAfter);
-                    stmt.executeUpdate();
-                }
-                try (PreparedStatement stmt = connection.prepareStatement(PURGE_BLOCKST.replace("$", table + ""))) {
-                    stmt.setInt(1, deleteAfter);
-                    stmt.executeUpdate();
-                }
-                try (PreparedStatement stmt = connection.prepareStatement(PURGE_BLOCKSNBT.replace("$", table + ""))) {
-                    stmt.setInt(1, deleteAfter);
-                    stmt.executeUpdate();
-                }
-                try (PreparedStatement stmt = connection.prepareStatement(UPDATE_TIME_BLOCKS.replace("$", table + "").replace("?", "" + shift))) {
-                    stmt.executeUpdate();
-                }
-                try (PreparedStatement stmt = connection.prepareStatement(UPDATE_TIME_BLOCKSF.replace("$", table + "").replace("?", "" + shift))) {
-                    stmt.executeUpdate();
-                }
-                try (PreparedStatement stmt = connection.prepareStatement(UPDATE_TIME_BLOCKST.replace("$", table + "").replace("?", "" + shift))) {
-                    stmt.executeUpdate();
-                }
-                try (PreparedStatement stmt = connection.prepareStatement(UPDATE_TIME_BLOCKSNBT.replace("$", table + "").replace("?", "" + shift))) {
-                    stmt.executeUpdate();
-                }
+                String updateTimeBlocks = "UPDATE `" + mainPrefix + "blocks" + table + "` SET time=time-" + shift;
+                String updateTimeBlocksf = "UPDATE `" + mainPrefix + "blocks" + table + "` SET time=time-" + shift;
+                String updateTimeBlockst = "UPDATE `" + mainPrefix + "blocks" + table + "` SET time=time-" + shift;
+                String updateTimeBlocksnbt = "UPDATE `" + mainPrefix + "blocks" + table + "` SET time=time-" + shift;
+
+                String purgeBlocks = "DELETE FROM `" + mainPrefix + "blocks" + table + "` WHERE `time`<?";
+                String purgeBlocksf = "DELETE FROM `" + mainPrefix + "blocksf" + table + "` WHERE `time`<?";
+                String purgeBlockst = "DELETE FROM `" + mainPrefix + "blockst" + table + "` WHERE `time`<?";
+                String purgeBlocksnbt = "DELETE FROM `" + mainPrefix + "blocksnbt" + table + "` WHERE `time`<?";
+
+                PreparedStatement block = getConnection().prepareStatement(updateTimeBlocks);
+                PreparedStatement blockNbt = getConnection().prepareStatement(updateTimeBlocksf);
+                PreparedStatement blockFromStmt = getConnection().prepareStatement(updateTimeBlockst);
+                PreparedStatement blockToStmt = getConnection().prepareStatement(updateTimeBlocksnbt);
+
+                PreparedStatement purgeBlock = getConnection().prepareStatement(purgeBlocks);
+                PreparedStatement purgeBlockNbt = getConnection().prepareStatement(purgeBlocksf);
+                PreparedStatement purgeBlockFromStmt = getConnection().prepareStatement(purgeBlockst);
+                PreparedStatement purgeBlockToStmt = getConnection().prepareStatement(purgeBlocksnbt);
+
+                purgeBlock.setInt(1, deleteAfter);
+                purgeBlockNbt.setInt(1, deleteAfter);
+                purgeBlockFromStmt.setInt(1, deleteAfter);
+                purgeBlockToStmt.setInt(1, deleteAfter);
+
+                block.executeUpdate();
+                blockNbt.executeUpdate();
+                blockFromStmt.executeUpdate();
+                blockToStmt.executeUpdate();
+
+                purgeBlock.executeUpdate();
+                purgeBlockNbt.executeUpdate();
+                purgeBlockFromStmt.executeUpdate();
+                purgeBlockToStmt.executeUpdate();
+
+                block.close();
+                blockNbt.close();
+                blockFromStmt.close();
+                blockToStmt.close();
+
+                purgeBlock.close();
+                purgeBlockNbt.close();
+                purgeBlockFromStmt.close();
+                purgeBlockToStmt.close();
             } catch (SQLException e) {
-                e.printStackTrace();
+                printSQLException(e);
             }
-            System.out.println((double) (i / size) / 100 + "%");
-            i += 10000;
         }
-        try (PreparedStatement stmt = connection.prepareStatement(UPDATE_TIME)) {
-            stmt.setLong(1, then >> TIME_PARTITION);
-            BASE_TIME = then >> TIME_PARTITION;
+
+        try (PreparedStatement stmt = getConnection().prepareStatement("UPDATE `" + mainPrefix + "timestamp` SET `time`=?")) {
+            stmt.setLong(1, then >> timePartition);
+            baseTime = then >> timePartition;
             stmt.executeUpdate();
         } catch (SQLException e) {
-            e.printStackTrace();
+            printSQLException(e);
         }
         commit();
-        System.out.println("Done purging!");
     }
 
-    public List<SimpleBlockChange> getChanges(int x, int y, int z) {
-        int cx = x >> 4;
-        int cz = z >> 4;
-        long pair = MathMan.pairInt(cx, cz);
-        Integer chunkId = CHUNK_LOC_ID.get(pair);
+    /**
+     * Get all of the changes within the point of the location
+     * The position is a little bit weird as I cannot find out why
+     * For now, you must include the short of the position vector
+     *
+     * @param chunkX The vector side-x of cartesian angle
+     * @param chunkZ The vector side-z of cartesian angle
+     * @param pos    Compressed position,
+     *               use {@link Utils#getVectorPair(Vector3)} for this operation
+     * @return All of the list and its data about the changed block
+     */
+    public List<Block> getChanges(int chunkX, int chunkZ, short pos) {
+        List<Block> changes = new ArrayList<>();
+        long pair = MathMan.pairInt(chunkX, chunkZ);
+
+        Integer chunkId = chunkLocId.get(pair);
         if (chunkId == null) {
-            return new ArrayList<>();
-        }
-        int table = chunkId >> TABLE_PARTITION;
-        byte chunkLocalId = (byte) (chunkId & ((1 << TABLE_PARTITION) - 1));
-        short pos = (short) ((MathMan.pair16((byte) (x & 15), (byte) (z & 15)) & 255) + (y << 8));
-        try {
-            ArrayList<SimpleBlockChange> changes = new ArrayList<>();
-            try (PreparedStatement stmt = connection.prepareStatement(GET_BLOCKFT_POS.replace("$", table + ""))) {
-                stmt.setByte(1, chunkLocalId);
-                stmt.setShort(2, pos);
-                try (ResultSet r = stmt.executeQuery()) {
-                    while (r.next()) {
-                        int fromTo = r.getInt(2);
-                        long time = (BASE_TIME + r.getInt(3)) << TIME_PARTITION;
-                        String player = PLAYER_ID_VARCHAR.get(r.getShort(1));
-                        changes.add(new SimpleBlockChange(x, y, z, MathMan.unpairX(fromTo), MathMan.unpairY(fromTo), null, null, player, time));
-                    }
-                }
-            }
-            try (PreparedStatement stmt = connection.prepareStatement(GET_BLOCKNBT_POS.replace("$", table + ""))) {
-                stmt.setByte(1, chunkLocalId);
-                stmt.setShort(2, pos);
-                try (ResultSet r = stmt.executeQuery()) {
-                    while (r.next()) {
-                        int fromTo = r.getInt(2);
-                        long time = (BASE_TIME + r.getInt(3)) << TIME_PARTITION;
-                        String player = PLAYER_ID_VARCHAR.get(r.getShort(1));
-                        changes.add(new SimpleBlockChange(x, y, z, MathMan.unpairX(fromTo), MathMan.unpairY(fromTo), toTag(r.getBytes(4)), toTag(r.getBytes(5)), player, time));
-                    }
-                }
-            }
-            try (PreparedStatement stmt = connection.prepareStatement(GET_BLOCKF_POS.replace("$", table + ""))) {
-                stmt.setByte(1, chunkLocalId);
-                stmt.setShort(2, pos);
-                try (ResultSet r = stmt.executeQuery()) {
-                    while (r.next()) {
-                        long time = (BASE_TIME + r.getInt(3)) << TIME_PARTITION;
-                        String player = PLAYER_ID_VARCHAR.get(r.getShort(1));
-                        changes.add(new SimpleBlockChange(x, y, z, r.getShort(2), 0, null, null, player, time));
-                    }
-                }
-            }
-            try (PreparedStatement stmt = connection.prepareStatement(GET_BLOCKT_POS.replace("$", table + ""))) {
-                stmt.setByte(1, chunkLocalId);
-                stmt.setShort(2, pos);
-                try (ResultSet r = stmt.executeQuery()) {
-                    while (r.next()) {
-                        long time = (BASE_TIME + r.getInt(3)) << TIME_PARTITION;
-                        String player = PLAYER_ID_VARCHAR.get(r.getShort(1));
-                        changes.add(new SimpleBlockChange(x, y, z, 0, r.getShort(2), null, null, player, time));
-                    }
-                }
-            }
-            Collections.sort(changes, new Comparator<SimpleBlockChange>() {
-                @Override
-                public int compare(SimpleBlockChange a, SimpleBlockChange b) {
-                    return (int) (a.timestamp - b.timestamp);
-                }
-            });
             return changes;
+        }
+
+        byte xz = (byte) (pos & 255);
+        int x = (MathMan.unpairIntX(pair) << 4) + MathMan.unpair16x(xz);
+        int z = (MathMan.unpairIntY(pair) << 4) + MathMan.unpair16y(xz);
+
+        Vector3 vec = new Vector3(x, (pos >> 8) & 255, z);
+
+        int table = chunkId >> tablePartition;
+        byte chunkLocalId = (byte) (chunkId & ((1 << tablePartition) - 1));
+
+        try {
+            String getBlockFromTo = GET_BLOCKFT_POS.replace("$", table + "");
+            String getBlockNBT = GET_BLOCKNBT_POS.replace("$", table + "");
+            String getBlockFrom = GET_BLOCKF_POS.replace("$", table + "");
+            String getBlockTo = GET_BLOCKT_POS.replace("$", table + "");
+
+            PreparedStatement fromToStmt = getConnection().prepareStatement(getBlockFromTo);
+            PreparedStatement NBTStmt = getConnection().prepareStatement(getBlockNBT);
+            PreparedStatement blockFromStmt = getConnection().prepareStatement(getBlockFrom);
+            PreparedStatement blockToStmt = getConnection().prepareStatement(getBlockTo);
+
+            fromToStmt.setByte(1, chunkLocalId);
+            fromToStmt.setShort(2, pos);
+            NBTStmt.setByte(1, chunkLocalId);
+            NBTStmt.setShort(2, pos);
+            blockFromStmt.setByte(1, chunkLocalId);
+            blockFromStmt.setShort(2, pos);
+            blockToStmt.setByte(1, chunkLocalId);
+            blockToStmt.setShort(2, pos);
+
+            ResultSet result1 = fromToStmt.executeQuery();
+            ResultSet result2 = NBTStmt.executeQuery();
+            ResultSet result3 = blockFromStmt.executeQuery();
+            ResultSet result4 = blockToStmt.executeQuery();
+
+            while (result1.next()) {
+                int fromTo = result1.getInt(2);
+
+                Block lock = new SimpleBlockChange(this, vec)
+                        .setBlockCombined(MathMan.unpairX(fromTo), MathMan.unpairY(fromTo))
+                        .setPlayerName(playerIdVarchar.get(result1.getShort(1)))
+                        .setChangeTime(result1.getInt(3))
+                        .setReverted(result1.getBoolean(4), result1.getInt(5));
+
+                changes.add(lock);
+            }
+
+            while (result2.next()) {
+                int fromTo = result2.getInt(2);
+
+                changes.add(new SimpleBlockChange(this, vec)
+                        .setBlockCombined(MathMan.unpairX(fromTo), MathMan.unpairY(fromTo))
+                        .setPlayerName(playerIdVarchar.get(result2.getShort(1)))
+                        .setChangeTime(result2.getInt(3))
+                        .setNBTData(toTag(result2.getBytes(4)), toTag(result2.getBytes(5)))
+                        .setReverted(result2.getBoolean(6), result2.getInt(7)));
+            }
+
+            while (result3.next()) {
+                int from = result3.getInt(2);
+
+                changes.add(new SimpleBlockChange(this, vec)
+                        .setBlockCombined((short) from, (short) 0)
+                        .setPlayerName(playerIdVarchar.get(result3.getShort(1)))
+                        .setChangeTime(result3.getInt(3))
+                        .setReverted(result3.getBoolean(4), result3.getInt(5)));
+            }
+
+            while (result4.next()) {
+                int to = result4.getInt(2);
+
+                changes.add(new SimpleBlockChange(this, vec)
+                        .setBlockCombined((short) 0, (short) to)
+                        .setPlayerName(playerIdVarchar.get(result4.getShort(1)))
+                        .setChangeTime(result4.getInt(3))
+                        .setReverted(result4.getBoolean(4), result4.getInt(5)));
+            }
+
+            changes.sort(Comparator.comparingInt(Block::getTimeChanged));
         } catch (SQLException e) {
-            e.printStackTrace();
-            return new ArrayList<>();
+            printSQLException(e);
         }
+        return changes;
     }
 
-    @Override
-    public void logBlock(String name, int x, int y, int z, short combinedFrom, short combinedTo, CompoundTag nbtFrom, CompoundTag nbtTo) {
-        BlockChange change = new BlockChange(name, x, y, z, combinedFrom, combinedTo, nbtFrom, nbtTo);
-        blockChanges.add(change);
-    }
+    /**
+     * Get all the blocks within the arguments that were given in this function.
+     * This returns to the blocks with the specific amount of data, the results
+     * should be all of the possible matching blocks of the specific data. This
+     * will only return the least matched timing value of the blocks.
+     *
+     * @param originX    The player x location
+     * @param originZ    The player z location
+     * @param radius     Radius of the blocks that need to be queried
+     * @param playerName The player name who need to be queried
+     * @param timeDiff   Milliseconds time of the player who made that action
+     * @return The blocks that been queried and placed.
+     */
+    public Map<Block, Integer> getBlocks(int originX, int originZ, int radius, String playerName, long timeDiff) {
+        int timeMinRel = (int) (((System.currentTimeMillis() - timeDiff) >> timePartition) - baseTime);
+        int chunkRadSqr = ((radius + 15) >> 4) * ((radius + 15) >> 4);
 
-    public void init() {
-        try {
-            connection = openConnection();
-            DatabaseMetaData dbm = connection.getMetaData();
-            ResultSet tables = dbm.getTables(null, null, prefix + "timestamp", null);
-            if (tables.next()) {
-                // Table exists
-                try (PreparedStatement stmt = connection.prepareStatement("SELECT `time` from `" + prefix + "timestamp`")) {
-                    ResultSet r = stmt.executeQuery();
-                    BASE_TIME = r.getLong(1);
-                }
-            } else {
-                BASE_TIME = (System.currentTimeMillis() >> TIME_PARTITION);
-                try (Statement stmt = connection.createStatement()) {
-                    if (this.mySql) {
-                        stmt.executeUpdate("SET GLOBAL innodb_file_per_table=1");
-                        stmt.executeUpdate("SET GLOBAL innodb_file_format=Barracuda");
-                        stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "players` (`id` MEDIUMINT NOT NULL AUTO_INCREMENT, `name` VARCHAR(16) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8 AUTO_INCREMENT=1 ROW_FORMAT=COMPRESSED");
-                        stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "chunks` (`id` MEDIUMINT NOT NULL AUTO_INCREMENT, `x` INT NOT NULL, `z` INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8 AUTO_INCREMENT=1 ROW_FORMAT=COMPRESSED");
-                        stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "timestamp` (`time` BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8");
-                        
-                    } else {
-                        stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "players` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `name` VARCHAR(16) NOT NULL)");
-                        stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "chunks` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `x` INT NOT NULL, `z` INT NOT NULL)");
-                        stmt.executeUpdate("CREATE TABLE IF NOT EXISTS `" + prefix + "timestamp` (`time` BIGINT NOT NULL)");
-                    }
-                    stmt.executeUpdate("INSERT INTO `" + prefix + "timestamp` (`time`) VALUES(" + BASE_TIME + ")");
-//                    stmt.executeBatch();
-                }
-            }
-
-            try (Statement stmt = connection.createStatement()) {
-                try (ResultSet r = stmt.executeQuery(GET_CHUNKS)) {
-                    while (r.next()) {
-                        int id = r.getInt(1);
-                        int x = r.getInt(2);
-                        int z = r.getInt(3);
-                        long pair = MathMan.pairInt(x, z);
-                        CHUNK_LOC_ID.put(pair, id);
-                        CHUNK_ID_LOC.put(id, pair);
-                    }
-                }
-                
-                try (ResultSet r = stmt.executeQuery(GET_PLAYERS)) {
-                    while (r.next()) {
-                        short id = (short) (r.getShort(1) + Short.MIN_VALUE);
-                        String name = r.getString(2);
-                        PLAYER_ID_VARCHAR.put(id, name);
-                        PLAYER_VARCHAR_ID.put(name, id);
-                    }
-                }
-            }
-            TaskManager.IMP.async(new Runnable() {
-                @Override
-                public void run() {
-                    long last = System.currentTimeMillis();
-                    boolean purged = false;
-                    while (true) {
-                        if (connection == null) {
-                            break;
-                        }
-                        if ((SQLDatabase.this instanceof MySQL) && ((System.currentTimeMillis() - last) > 550000)) {
-                            last = System.currentTimeMillis();
-                            try {
-                                closeConnection();
-                                connection = SQLDatabase.this.forceConnection();
-                            } catch (SQLException | ClassNotFoundException e) {
-                                e.printStackTrace();
-                            }
-                        }
-                        if (!purged) {
-                            purge((int) TimeUnit.DAYS.toMillis(Config.PURGE_DAYS));
-                            purged = true;
-                        }
-                        if (!SQLDatabase.this.sendBatch()) {
-                            try {
-                                if ((notify != null) && (notify.size() > 0)) {
-                                    for (final Runnable runnable : notify) {
-                                        runnable.run();
-                                    }
-                                    notify.clear();
-                                }
-                                Thread.sleep(50);
-                            } catch (final InterruptedException e) {
-                                e.printStackTrace();
-                            }
-                        }
-                    }
-                }
-            });
-        } catch (final Exception e) {
-            e.printStackTrace();
-        }
-    }
-    
-    private boolean sendBatch() {
-        try {
-            runTasks();
-            commit();
-            if (connection.getAutoCommit()) {
-                connection.setAutoCommit(false);
-            }
-            int size = Math.min(1048572, blockChanges.size());
-            
-            if (size == 0) {
-                return false;
-            }
-
-            BlockChange[] copy = new BlockChange[size];
-            for (int i = 0; i < size; i++) {
-                copy[i] = blockChanges.poll();
-            }
-            
-            PreparedStatement playerStmt = null;
-            for (BlockChange change : copy) {
-                if (!change.hasPlayerId()) {
-                    if (playerStmt == null) {
-                        playerStmt = connection.prepareStatement(INSERT_PLAYER, Statement.RETURN_GENERATED_KEYS);
-                    }
-                    change.createPlayerId(playerStmt);
-                }
-            }
-            if (playerStmt != null) {
-                playerStmt.close();
-            }
-
-            int minTable = Integer.MAX_VALUE;
-            int maxTable = 0;
-            PreparedStatement chunkStmt = null;
-            for (BlockChange change : copy) {
-                if (!change.hasChunkId()) {
-                    if (chunkStmt == null) {
-                        chunkStmt = connection.prepareStatement(INSERT_CHUNK, Statement.RETURN_GENERATED_KEYS);
-                    }
-                    change.createChunkId(chunkStmt);
-                }
-                int table = change.getTableId();
-                if (table < minTable) {
-                    minTable = table;
-                }
-                if (table > maxTable) {
-                    maxTable = table;
-                }
-            }
-            if (chunkStmt != null) {
-                chunkStmt.close();
-            }
-            
-            PreparedStatement[] blockftStmts = new PreparedStatement[maxTable - minTable + 1];
-            PreparedStatement[] blockfStmts = new PreparedStatement[maxTable - minTable + 1];
-            PreparedStatement[] blocktStmts = new PreparedStatement[maxTable - minTable + 1];
-            PreparedStatement[] blocknbtStmts = new PreparedStatement[maxTable - minTable + 1];
-
-            for (BlockChange change : copy) {
-                int table = change.getChunkId() >> TABLE_PARTITION;
-                int stmtIndex = table - minTable;
-                PreparedStatement blockStmt;
-                if (change.hasNBT()) {
-                    blockStmt = blocknbtStmts[stmtIndex];
-                    if (blockStmt == null) {
-                        blockStmt = blockfStmts[stmtIndex] = connection.prepareStatement(INSERT_BLOCKNBT.replace("$", table + ""));
-                    }
-                    blockStmt.setInt(4, change.getChangePair());
-                    byte[] nbtf = change.getNbtFrom();
-                    byte[] nbtt = change.getNbtTo();
-                    blockStmt.setBytes(6, nbtf);
-                    blockStmt.setBytes(7, nbtt);
-                } else if (change.getTo() == 0) {
-                    blockStmt = blockfStmts[stmtIndex];
-                    if (blockStmt == null) {
-                        blockStmt = blockfStmts[stmtIndex] = connection.prepareStatement(INSERT_BLOCKF.replace("$", table + ""));
-                    }
-                    blockStmt.setShort(4, change.getFrom());
-                } else if (change.getFrom() == 0) {
-                    blockStmt = blocktStmts[stmtIndex];
-                    if (blockStmt == null) {
-                        blockStmt = blocktStmts[stmtIndex] = connection.prepareStatement(INSERT_BLOCKT.replace("$", table + ""));
-                    }
-                    blockStmt.setShort(4, change.getTo());
-                } else {
-                    blockStmt = blockftStmts[stmtIndex];
-                    if (blockStmt == null) {
-                        blockStmt = blockftStmts[stmtIndex] = connection.prepareStatement(INSERT_BLOCKFT.replace("$", table + ""));
-                    }
-                    blockStmt.setInt(4, change.getChangePair());
-                }
-                blockStmt.setShort(1, change.getPlayerId());
-                blockStmt.setByte(2, change.getReducedChunkId());
-                blockStmt.setShort(3, change.getPos());
-                blockStmt.setInt(5, change.getTime());
-                blockStmt.addBatch();
-            }
-            for (PreparedStatement blockStmt : blocknbtStmts) {
-                if (blockStmt != null) {
-                    blockStmt.executeBatch();
-                    blockStmt.close();
-                }
-            }
-            for (PreparedStatement blockStmt : blockftStmts) {
-                if (blockStmt != null) {
-                    blockStmt.executeBatch();
-                    blockStmt.close();
-                }
-            }
-            for (PreparedStatement blockStmt : blockfStmts) {
-                if (blockStmt != null) {
-                    blockStmt.executeBatch();
-                    blockStmt.close();
-                }
-            }
-            for (PreparedStatement blockStmt : blocktStmts) {
-                if (blockStmt != null) {
-                    blockStmt.executeBatch();
-                    blockStmt.close();
-                }
-            }
-            commit();
-            return true;
-        } catch (final Exception e) {
-            e.printStackTrace();
-        }
-        return false;
-    }
-    
-    public void commit() {
-        try {
-            if (connection == null) {
-                return;
-            }
-            if (!connection.getAutoCommit()) {
-                connection.commit();
-                connection.setAutoCommit(true);
-            }
-        } catch (final SQLException e) {
-            e.printStackTrace();
-        }
-    }
-    
-    public int getBlocks(int originX, int originZ, int radius, String name, long timeDiff, RunnableVal<SimpleBlockChange> result) {
-        Short playerId = PLAYER_VARCHAR_ID.get(name);
-        if (playerId == null) {
-            return 0;
-        }
-        int timeMinRel = (int) (((System.currentTimeMillis() - timeDiff) >> TIME_PARTITION) - BASE_TIME);
-        int originChunkX = originX >> 4;
-        int originChunkZ = originZ >> 4;
-        int chunkRadius = (radius + 15) >> 4;
-        int chunkRadSqr = chunkRadius * chunkRadius;
         HashSet<Integer> tables = new HashSet<>();
-        for (Entry<Long, Integer> entry : CHUNK_LOC_ID.entrySet()) {
-            long coord = entry.getKey();
-            int cx = MathMan.unpairIntX(coord);
-            int cz = MathMan.unpairIntY(coord);
-            int dx = cx - originChunkX;
-            int dz = cz - originChunkZ;
+        HashMap<Block, Integer> changes = new HashMap<>();
+        for (Entry<Long, Integer> entry : chunkLocId.entrySet()) {
+            int dx = MathMan.unpairIntX(entry.getKey()) - (originX >> 4);
+            int dz = MathMan.unpairIntY(entry.getKey()) - (originZ >> 4);
             int chunkDistSqr = dx * dx + dz * dz;
+
             if (chunkDistSqr <= chunkRadSqr) {
-                int table = entry.getValue() >> TABLE_PARTITION;
-                tables.add(table);
+                tables.add(entry.getValue() >> tablePartition);
             }
         }
+
         if (tables.isEmpty()) {
-            return 0;
+            return changes;
         }
+
         int radiusSqr = radius * radius;
-        int count = 0;
+
         for (int table : tables) {
             try {
-                HashMap<SimpleBlockChange, Long> changes = new HashMap<>();
-                try (PreparedStatement stmt = connection.prepareStatement(GET_BLOCKFT_VARCHAR_TIME.replace("$", table + ""))) {
-                    stmt.setShort(1, playerId);
-                    stmt.setInt(2, timeMinRel);
-                    try (ResultSet r = stmt.executeQuery()) {
-                        while (r.next()) {
-                            short pos = r.getShort(2);
-                            long chunkCoord = CHUNK_ID_LOC.get((table << TABLE_PARTITION) + (r.getByte(1) & 255));
-                            byte xz = (byte) (pos & 255);
-                            int x = (MathMan.unpairIntX(chunkCoord) << 4) + MathMan.unpair16x(xz);
-                            int z = (MathMan.unpairIntY(chunkCoord) << 4) + MathMan.unpair16y(xz);
-                            int dx = x - originX;
-                            int dz = z - originZ;
-                            if (dx * dx + dz * dz > radiusSqr) {
-                                continue;
-                            }
-                            int fromTo = r.getInt(3);
-                            SimpleBlockChange change = new SimpleBlockChange(x, (pos >> 8) & 255, z, MathMan.unpairX(fromTo), MathMan.unpairY(fromTo), null, null, name, r.getInt(4));
-                            Long existing = changes.get(change);
-                            if (existing != null) {
-                                if (existing < change.timestamp) {
-                                    continue;
-                                }
-                                changes.remove(change);
-                            }
-                            changes.put(change, change.timestamp);
-                        }
+                PreparedStatement fromToStmt;
+                PreparedStatement NBTStmt;
+                PreparedStatement blockFromStmt;
+                PreparedStatement blockToStmt;
+
+                if (playerName == null) {
+                    // SqlDatabase (Get the area blocks by time)
+                    // Put them all in one, so that they will query all in one time
+                    String getBlockFromTo = GET_BLOCKFT_TIME.replace("$", table + "");
+                    String getBlockNBT = GET_BLOCKNBT_TIME.replace("$", table + "");
+                    String getBlockFrom = GET_BLOCKF_TIME.replace("$", table + "");
+                    String getBlockTo = GET_BLOCKT_TIME.replace("$", table + "");
+
+                    fromToStmt = getConnection().prepareStatement(getBlockFromTo);
+                    NBTStmt = getConnection().prepareStatement(getBlockNBT);
+                    blockFromStmt = getConnection().prepareStatement(getBlockFrom);
+                    blockToStmt = getConnection().prepareStatement(getBlockTo);
+
+                    // Set them
+                    fromToStmt.setInt(1, timeMinRel);
+                    NBTStmt.setInt(1, timeMinRel);
+                    blockFromStmt.setInt(1, timeMinRel);
+                    blockToStmt.setInt(1, timeMinRel);
+                } else {
+                    Short playerId = playerVarcharId.get(playerName);
+
+                    // SqlDatabase (Get the area blocks by player and time)
+                    // Put them all in one, so that they will query all in one time
+                    String getBlockFromTo = GET_BLOCKFT_VARCHAR_TIME.replace("$", table + "");
+                    String getBlockNBT = GET_BLOCKNBT_VARCHAR_TIME.replace("$", table + "");
+                    String getBlockFrom = GET_BLOCKF_VARCHAR_TIME.replace("$", table + "");
+                    String getBlockTo = GET_BLOCKT_VARCHAR_TIME.replace("$", table + "");
+
+                    fromToStmt = getConnection().prepareStatement(getBlockFromTo);
+                    NBTStmt = getConnection().prepareStatement(getBlockNBT);
+                    blockFromStmt = getConnection().prepareStatement(getBlockFrom);
+                    blockToStmt = getConnection().prepareStatement(getBlockTo);
+
+                    // Set them
+                    fromToStmt.setShort(1, playerId);
+                    fromToStmt.setInt(2, timeMinRel);
+                    NBTStmt.setShort(1, playerId);
+                    NBTStmt.setInt(2, timeMinRel);
+                    blockFromStmt.setShort(1, playerId);
+                    blockFromStmt.setInt(2, timeMinRel);
+                    blockToStmt.setShort(1, playerId);
+                    blockToStmt.setInt(2, timeMinRel);
+                }
+
+                // Get the result of it
+                ResultSet result1 = fromToStmt.executeQuery();
+                ResultSet result2 = NBTStmt.executeQuery();
+                ResultSet result3 = blockFromStmt.executeQuery();
+                ResultSet result4 = blockToStmt.executeQuery();
+
+                while (result1.next()) {
+                    Vector3 vec = Utils.unpairVector(result1.getShort(2), chunkIdLoc.get((table << tablePartition) + (result1.getByte(1) & 255)));
+
+                    // The distance that above this ignores it.
+                    if (vec.distance(new Vector3(originX, vec.y, originZ)) > radiusSqr) {
+                        continue;
                     }
-                }
-                try (PreparedStatement stmt = connection.prepareStatement(GET_BLOCKNBT_VARCHAR_TIME.replace("$", table + ""))) {
-                    stmt.setShort(1, playerId);
-                    stmt.setInt(2, timeMinRel);
-                    try (ResultSet r = stmt.executeQuery()) {
-                        while (r.next()) {
-                            short pos = r.getShort(2);
-                            long chunkCoord = CHUNK_ID_LOC.get((table << TABLE_PARTITION) + (r.getByte(1) & 255));
-                            byte xz = (byte) (pos & 255);
-                            int x = (MathMan.unpairIntX(chunkCoord) << 4) + MathMan.unpair16x(xz);
-                            int z = (MathMan.unpairIntY(chunkCoord) << 4) + MathMan.unpair16y(xz);
-                            int dx = x - originX;
-                            int dz = z - originZ;
-                            if (dx * dx + dz * dz > radiusSqr) {
-                                continue;
-                            }
-                            int fromTo = r.getInt(3);
-                            SimpleBlockChange change = new SimpleBlockChange(x, (pos >> 8) & 255, z, MathMan.unpairX(fromTo), MathMan.unpairY(fromTo), toTag(r.getBytes(5)), toTag(r.getBytes(6)),
-                            name, r.getInt(4));
-                            Long existing = changes.get(change);
-                            if (existing != null) {
-                                if (existing < change.timestamp) {
-                                    continue;
-                                }
-                                changes.remove(change);
-                            }
-                            changes.put(change, change.timestamp);
+                    int fromTo = result1.getInt(3);
+                    String playerData = playerIdVarchar.get(result1.getShort(6));
+
+                    Block change = new SimpleBlockChange(this, vec)
+                            .setBlockCombined(MathMan.unpairX(fromTo), MathMan.unpairY(fromTo))
+                            .setPlayerName(playerData)
+                            .setChangeTime(result1.getInt(4))
+                            .setReverted(result1.getBoolean(5), result1.getInt(7));
+
+                    Integer existing = changes.get(change);
+                    if (existing != null) {
+                        if (existing < change.getTimeChanged()) {
+                            continue;
                         }
+                        changes.remove(change);
                     }
+                    changes.put(change, change.getTimeChanged());
                 }
-                try (PreparedStatement stmt = connection.prepareStatement(GET_BLOCKF_VARCHAR_TIME.replace("$", table + ""))) {
-                    stmt.setShort(1, playerId);
-                    stmt.setInt(2, timeMinRel);
-                    try (ResultSet r = stmt.executeQuery()) {
-                        while (r.next()) {
-                            short pos = r.getShort(2);
-                            long chunkCoord = CHUNK_ID_LOC.get((table << TABLE_PARTITION) + (r.getByte(1) & 255));
-                            byte xz = (byte) (pos & 255);
-                            int x = (MathMan.unpairIntX(chunkCoord) << 4) + MathMan.unpair16x(xz);
-                            int z = (MathMan.unpairIntY(chunkCoord) << 4) + MathMan.unpair16y(xz);
-                            int dx = x - originX;
-                            int dz = z - originZ;
-                            if (dx * dx + dz * dz > radiusSqr) {
-                                continue;
-                            }
-                            SimpleBlockChange change = new SimpleBlockChange(x, (pos >> 8) & 255, z, r.getInt(3), 0, null, null, name, r.getInt(4));
-                            Long existing = changes.get(change);
-                            if (existing != null) {
-                                if (existing < change.timestamp) {
-                                    continue;
-                                }
-                                changes.remove(change);
-                            }
-                            changes.put(change, change.timestamp);
+
+                while (result2.next()) {
+                    Vector3 vec = Utils.unpairVector(result2.getShort(2), chunkIdLoc.get((table << tablePartition) + (result2.getByte(1) & 255)));
+
+                    // The distance that above this ignores it.
+                    if (vec.distance(new Vector3(originX, vec.y, originZ)) > radiusSqr) {
+                        continue;
+                    }
+                    int fromTo = result2.getInt(3);
+                    String playerData = playerIdVarchar.get(result2.getShort(8));
+
+                    Block change = new SimpleBlockChange(this, vec)
+                            .setBlockCombined(MathMan.unpairX(fromTo), MathMan.unpairY(fromTo))
+                            .setNBTData(toTag(result2.getBytes(5)), toTag(result2.getBytes(6)))
+                            .setPlayerName(playerData)
+                            .setChangeTime(result2.getInt(4))
+                            .setReverted(result2.getBoolean(7), result2.getInt(9));
+
+                    Integer existing = changes.get(change);
+                    if (existing != null) {
+                        if (existing < change.getTimeChanged()) {
+                            continue;
                         }
+                        changes.remove(change);
                     }
+                    changes.put(change, change.getTimeChanged());
                 }
-                try (PreparedStatement stmt = connection.prepareStatement(GET_BLOCKT_VARCHAR_TIME.replace("$", table + ""))) {
-                    stmt.setShort(1, playerId);
-                    stmt.setInt(2, timeMinRel);
-                    try (ResultSet r = stmt.executeQuery()) {
-                        while (r.next()) {
-                            short pos = r.getShort(2);
-                            long chunkCoord = CHUNK_ID_LOC.get((table << TABLE_PARTITION) + (r.getByte(1) & 255));
-                            byte xz = (byte) (pos & 255);
-                            int x = (MathMan.unpairIntX(chunkCoord) << 4) + MathMan.unpair16x(xz);
-                            int z = (MathMan.unpairIntY(chunkCoord) << 4) + MathMan.unpair16y(xz);
-                            int dx = x - originX;
-                            int dz = z - originZ;
-                            if (dx * dx + dz * dz > radiusSqr) {
-                                continue;
-                            }
-                            SimpleBlockChange change = new SimpleBlockChange(x, (pos >> 8) & 255, z, 0, r.getInt(3), null, null, name, r.getInt(4));
-                            Long existing = changes.get(change);
-                            if (existing != null) {
-                                if (existing < change.timestamp) {
-                                    continue;
-                                }
-                                changes.remove(change);
-                            }
-                            changes.put(change, change.timestamp);
+
+                while (result3.next()) {
+                    Vector3 vec = Utils.unpairVector(result3.getShort(2), chunkIdLoc.get((table << tablePartition) + (result3.getByte(1) & 255)));
+
+                    // The distance that above this ignores it.
+                    if (vec.distance(new Vector3(originX, vec.y, originZ)) > radiusSqr) {
+                        continue;
+                    }
+                    short from = result3.getShort(3);
+                    String playerData = playerIdVarchar.get(result3.getShort(6));
+
+                    Block change = new SimpleBlockChange(this, vec)
+                            .setBlockCombined(from, (short) 0)
+                            .setPlayerName(playerData)
+                            .setChangeTime(result3.getInt(4))
+                            .setReverted(result3.getBoolean(5), result3.getInt(7));
+
+                    Integer existing = changes.get(change);
+                    if (existing != null) {
+                        if (existing < change.getTimeChanged()) {
+                            continue;
                         }
+                        changes.remove(change);
                     }
+                    changes.put(change, change.getTimeChanged());
                 }
-                for (Entry<SimpleBlockChange, Long> entry : changes.entrySet()) {
-                    result.run(entry.getKey());
+
+                while (result4.next()) {
+                    Vector3 vec = Utils.unpairVector(result4.getShort(2), chunkIdLoc.get((table << tablePartition) + (result4.getByte(1) & 255)));
+
+                    // The distance that above this ignores it.
+                    if (vec.distance(new Vector3(originX, vec.y, originZ)) > radiusSqr) {
+                        continue;
+                    }
+                    short to = result4.getShort(3);
+                    String playerData = playerIdVarchar.get(result4.getShort(6));
+
+                    Block change = new SimpleBlockChange(this, vec)
+                            .setBlockCombined((short) 0, to)
+                            .setPlayerName(playerData)
+                            .setChangeTime(result4.getInt(4))
+                            .setReverted(result4.getBoolean(5), result4.getInt(7));
+
+                    Integer existing = changes.get(change);
+                    if (existing != null) {
+                        if (existing < change.getTimeChanged()) {
+                            continue;
+                        }
+                        changes.remove(change);
+                    }
+                    changes.put(change, change.getTimeChanged());
                 }
-                count += changes.size();
+
+                // Close them after finish the operation,
+                // Don't pool them
+                fromToStmt.close();
+                NBTStmt.close();
+                blockFromStmt.close();
+                blockToStmt.close();
+
+                result1.close();
+                result2.close();
+                result3.close();
+                result4.close();
             } catch (SQLException e) {
-                e.printStackTrace();
+                printSQLException(e);
             }
         }
-        return count;
+        return changes;
     }
 
-    public abstract Connection forceConnection() throws SQLException, ClassNotFoundException;
-    
+    /**
+     * Get all the blocks within the arguments that were given in this function.
+     * This returns to the blocks with the specific amount of data, the results
+     * should be all of the possible matching blocks of the specific data. This
+     * will return the latest blocks changes.
+     *
+     * @param originX    The player x location
+     * @param originZ    The player z location
+     * @param radius     Radius of the blocks that need to be queried
+     * @param playerName The player name who need to be queried
+     * @param timeDiff   Milliseconds time of the player who made that action
+     * @return The blocks that been queried and placed.
+     */
+    public List<Block> getAllBlocks(int originX, int originZ, int radius, String playerName, long timeDiff) {
+        int timeMinRel = (int) (((System.currentTimeMillis() - timeDiff) >> timePartition) - baseTime);
+        int chunkRadSqr = ((radius + 15) >> 4) * ((radius + 15) >> 4);
+
+        List<Block> changes = new ArrayList<>();
+        HashSet<Integer> tables = new HashSet<>();
+        for (Entry<Long, Integer> entry : chunkLocId.entrySet()) {
+            int dx = MathMan.unpairIntX(entry.getKey()) - (originX >> 4);
+            int dz = MathMan.unpairIntY(entry.getKey()) - (originZ >> 4);
+            int chunkDistSqr = dx * dx + dz * dz;
+
+            if (chunkDistSqr <= chunkRadSqr) {
+                tables.add(entry.getValue() >> tablePartition);
+            }
+        }
+
+        if (tables.isEmpty()) {
+            return changes;
+        }
+
+        int radiusSqr = radius * radius;
+
+        for (int table : tables) {
+            try {
+                PreparedStatement fromToStmt;
+                PreparedStatement NBTStmt;
+                PreparedStatement blockFromStmt;
+                PreparedStatement blockToStmt;
+
+                if (playerName == null) {
+                    // SqlDatabase (Get the area blocks by time)
+                    // Put them all in one, so that they will query all in one time
+                    String getBlockFromTo = GET_BLOCKFT_TIME.replace("$", table + "");
+                    String getBlockNBT = GET_BLOCKNBT_TIME.replace("$", table + "");
+                    String getBlockFrom = GET_BLOCKF_TIME.replace("$", table + "");
+                    String getBlockTo = GET_BLOCKT_TIME.replace("$", table + "");
+
+                    fromToStmt = getConnection().prepareStatement(getBlockFromTo);
+                    NBTStmt = getConnection().prepareStatement(getBlockNBT);
+                    blockFromStmt = getConnection().prepareStatement(getBlockFrom);
+                    blockToStmt = getConnection().prepareStatement(getBlockTo);
+
+                    // Set them
+                    fromToStmt.setInt(1, timeMinRel);
+                    NBTStmt.setInt(1, timeMinRel);
+                    blockFromStmt.setInt(1, timeMinRel);
+                    blockToStmt.setInt(1, timeMinRel);
+                } else {
+                    Short playerId = playerVarcharId.get(playerName);
+
+                    // SqlDatabase (Get the area blocks by player and time)
+                    // Put them all in one, so that they will query all in one time
+                    String getBlockFromTo = GET_BLOCKFT_VARCHAR_TIME.replace("$", table + "");
+                    String getBlockNBT = GET_BLOCKNBT_VARCHAR_TIME.replace("$", table + "");
+                    String getBlockFrom = GET_BLOCKF_VARCHAR_TIME.replace("$", table + "");
+                    String getBlockTo = GET_BLOCKT_VARCHAR_TIME.replace("$", table + "");
+
+                    fromToStmt = getConnection().prepareStatement(getBlockFromTo);
+                    NBTStmt = getConnection().prepareStatement(getBlockNBT);
+                    blockFromStmt = getConnection().prepareStatement(getBlockFrom);
+                    blockToStmt = getConnection().prepareStatement(getBlockTo);
+
+                    // Set them
+                    fromToStmt.setShort(1, playerId);
+                    fromToStmt.setInt(2, timeMinRel);
+                    NBTStmt.setShort(1, playerId);
+                    NBTStmt.setInt(2, timeMinRel);
+                    blockFromStmt.setShort(1, playerId);
+                    blockFromStmt.setInt(2, timeMinRel);
+                    blockToStmt.setShort(1, playerId);
+                    blockToStmt.setInt(2, timeMinRel);
+                }
+
+                // Get the result of it
+                ResultSet result1 = fromToStmt.executeQuery();
+                ResultSet result2 = NBTStmt.executeQuery();
+                ResultSet result3 = blockFromStmt.executeQuery();
+                ResultSet result4 = blockToStmt.executeQuery();
+
+                while (result1.next()) {
+                    Vector3 vec = Utils.unpairVector(result1.getShort(2), chunkIdLoc.get((table << tablePartition) + (result1.getByte(1) & 255)));
+
+                    // The distance that above this ignores it.
+                    if (vec.distance(new Vector3(originX, vec.y, originZ)) > radiusSqr) {
+                        continue;
+                    }
+                    int fromTo = result1.getInt(3);
+                    String playerData = playerIdVarchar.get(result1.getShort(6));
+
+                    Block change = new SimpleBlockChange(this, vec)
+                            .setBlockCombined(MathMan.unpairX(fromTo), MathMan.unpairY(fromTo))
+                            .setPlayerName(playerData)
+                            .setChangeTime(result1.getInt(4))
+                            .setReverted(result1.getBoolean(5), result1.getInt(7));
+
+                    changes.add(change);
+                }
+
+                while (result2.next()) {
+                    Vector3 vec = Utils.unpairVector(result2.getShort(2), chunkIdLoc.get((table << tablePartition) + (result2.getByte(1) & 255)));
+
+                    // The distance that above this ignores it.
+                    if (vec.distance(new Vector3(originX, vec.y, originZ)) > radiusSqr) {
+                        continue;
+                    }
+                    int fromTo = result2.getInt(3);
+                    String playerData = playerIdVarchar.get(result2.getShort(8));
+
+                    Block change = new SimpleBlockChange(this, vec)
+                            .setBlockCombined(MathMan.unpairX(fromTo), MathMan.unpairY(fromTo))
+                            .setNBTData(toTag(result2.getBytes(5)), toTag(result2.getBytes(6)))
+                            .setPlayerName(playerData)
+                            .setChangeTime(result2.getInt(4))
+                            .setReverted(result2.getBoolean(7), result2.getInt(9));
+
+                    changes.add(change);
+                }
+
+                while (result3.next()) {
+                    Vector3 vec = Utils.unpairVector(result3.getShort(2), chunkIdLoc.get((table << tablePartition) + (result3.getByte(1) & 255)));
+
+                    // The distance that above this ignores it.
+                    if (vec.distance(new Vector3(originX, vec.y, originZ)) > radiusSqr) {
+                        continue;
+                    }
+                    short from = result3.getShort(3);
+                    String playerData = playerIdVarchar.get(result3.getShort(6));
+
+                    Block change = new SimpleBlockChange(this, vec)
+                            .setBlockCombined(from, (short) 0)
+                            .setPlayerName(playerData)
+                            .setChangeTime(result3.getInt(4))
+                            .setReverted(result3.getBoolean(5), result3.getInt(7));
+
+                    changes.add(change);
+                }
+
+                while (result4.next()) {
+                    Vector3 vec = Utils.unpairVector(result4.getShort(2), chunkIdLoc.get((table << tablePartition) + (result4.getByte(1) & 255)));
+
+                    // The distance that above this ignores it.
+                    if (vec.distance(new Vector3(originX, vec.y, originZ)) > radiusSqr) {
+                        continue;
+                    }
+                    short to = result4.getShort(3);
+                    String playerData = playerIdVarchar.get(result4.getShort(6));
+
+                    Block change = new SimpleBlockChange(this, vec)
+                            .setBlockCombined((short) 0, to)
+                            .setPlayerName(playerData)
+                            .setChangeTime(result4.getInt(4))
+                            .setReverted(result4.getBoolean(5), result4.getInt(7));
+
+                    changes.add(change);
+                }
+
+                // Close them after finish the operation,
+                // Don't pool them
+                fromToStmt.close();
+                NBTStmt.close();
+                blockFromStmt.close();
+                blockToStmt.close();
+
+                result1.close();
+                result2.close();
+                result3.close();
+                result4.close();
+            } catch (SQLException e) {
+                printSQLException(e);
+            }
+        }
+        return changes;
+    }
+
+    public abstract void forceConnection() throws SQLException, ClassNotFoundException;
+
     /**
      * Opens a connection with the database
      *
-     * @return Opened connection
-     * @throws java.sql.SQLException  if the connection can not be opened
+     * @throws SQLException           if the connection can not be opened
      * @throws ClassNotFoundException if the driver cannot be found
      */
-    public abstract Connection openConnection() throws SQLException, ClassNotFoundException;
-    
-    /**
-     * Gets the connection with the database
-     *
-     * @return Connection with the database, null if none
-     */
-    public Connection getConnection() {
-        if (connection == null) {
-            try {
-                forceConnection();
-            } catch (final ClassNotFoundException e) {
-                e.printStackTrace();
-            } catch (final SQLException e) {
-                e.printStackTrace();
-            }
-        }
-        return connection;
-    }
-    
+    public abstract void openConnection() throws SQLException, ClassNotFoundException;
+
     /**
      * Closes the connection with the database
      *
-     * @return true if successful
-     * @throws java.sql.SQLException if the connection cannot be closed
+     * @throws SQLException if the connection cannot be closed
      */
-    public boolean closeConnection() throws SQLException {
-        if (connection == null) {
-            return false;
-        }
-        connection.close();
-        connection = null;
-        return true;
-    }
-    
+    public abstract void closeConnection() throws SQLException;
+
     /**
      * Checks if a connection is open with the database
      *
      * @return true if the connection is open
-     * @throws java.sql.SQLException if the connection cannot be checked
+     * @throws SQLException if the connection cannot be checked
      */
-    public boolean checkConnection() {
-        try {
-            return (connection != null) && !connection.isClosed();
-        } catch (final SQLException e) {
-            return false;
+    public abstract boolean checkConnection() throws SQLException;
+
+    /**
+     * Gets the connection with the database.
+     *
+     * @return Connection with the database, null if none
+     */
+    public abstract Connection getConnection();
+
+    /**
+     * Automatically commit the action
+     */
+    protected abstract void commit();
+
+    /**
+     * Automatically commit an action by
+     * their setAutoCommit.
+     *
+     * @param setAutoCommit Should the task be committed?
+     */
+    protected abstract void commit(boolean setAutoCommit);
+
+    /**
+     * Attempts to create a new player and updates its keys into the program.
+     * This function is used internally.
+     *
+     * @param statement The statement where the sql will create a new player id.
+     * @param block     The block change made by the player.
+     * @throws SQLException self-explanatory.
+     */
+    private void createPlayerId(PreparedStatement statement, BlockChange block) throws SQLException {
+        statement.setString(1, block.getPlayerName());
+        statement.executeUpdate();
+        ResultSet keys = statement.getGeneratedKeys();
+        if (keys.next()) {
+            block.setPlayerId((short) (keys.getShort(1) + Short.MIN_VALUE));
+            playerIdVarchar.put(block.getPlayerId(), block.getPlayerName());
+            playerVarcharId.put(block.getPlayerName(), block.getPlayerId());
         }
+    }
+
+    private void createChunkId(PreparedStatement stmt, BlockChange block) throws SQLException {
+        long pair = MathMan.pairInt(block.getChunkX(), block.getChunkZ());
+
+        stmt.setInt(1, block.getChunkX());
+        stmt.setInt(2, block.getChunkZ());
+        stmt.executeUpdate();
+
+        ResultSet keys = stmt.getGeneratedKeys();
+        if (keys.next()) {
+            int chunkId = keys.getInt(1);
+            if ((chunkId & ((1 << tablePartition) - 1)) == 0 || block.getDatabase().chunkIdLoc.size() == 0) {
+                // Realign the numbers, checked this, its always return 0 if its not exist.
+                int table = chunkId >> tablePartition;
+                Statement create = getConnection().createStatement();
+                if (useServer) {
+                    create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "blocks" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` INT NOT NULL, `time` INT NOT NULL, `reverted` INT DEFAULT FALSE, `timeReverted` INT) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPRESSED");
+                    create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "blocksf" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT  NOT NULL, `time` INT NOT NULL, `reverted` INT DEFAULT FALSE, `timeReverted` INT) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPRESSED");
+                    create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "blockst" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `time` INT NOT NULL, `reverted` INT DEFAULT FALSE, `timeReverted` INT) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPRESSED");
+                    create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "blocksnbt" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `nbtf` BLOB, `nbtt` BLOB, `time` INT NOT NULL, `timeReverted` INT, `reverted` INT DEFAULT FALSE) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPRESSED");
+                } else {
+                    create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "blocks" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` INT NOT NULL, `time` INT NOT NULL, `reverted` INT DEFAULT FALSE, `timeReverted` INT)");
+                    create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "blocksf" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `time` INT NOT NULL, `reverted` INT DEFAULT FALSE, `timeReverted` INT)");
+                    create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "blockst" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `time` INT NOT NULL, `reverted` INT DEFAULT FALSE, `timeReverted` INT)");
+                    create.executeUpdate("CREATE TABLE IF NOT EXISTS `" + mainPrefix + "blocksnbt" + table + "` (`player` SMALLINT NOT NULL, `chunk` TINYINT NOT NULL, `pos` SMALLINT NOT NULL, `change` SMALLINT NOT NULL, `nbtf` BLOB, `nbtt` BLOB, `time` INT NOT NULL, `reverted` INT DEFAULT FALSE, `timeReverted` INT)");
+                }
+            }
+            block.getDatabase().chunkIdLoc.put(chunkId, pair);
+            block.getDatabase().chunkLocId.put(pair, chunkId);
+        }
+    }
+
+    public int getLastBatchSize() {
+        return lastBatchSize.get();
+    }
+
+    public long getPing() {
+        return lastPingedConnection.get();
+    }
+
+    public boolean isBusy() {
+        long systemTime = System.currentTimeMillis();
+        long batchTime = currentPingedConnection.get();
+        long nowTime = systemTime - batchTime;
+
+        // Larger batches
+        return nowTime >= 600 && lastPingedConnection.get() == -1;
     }
 }

@@ -1,86 +1,129 @@
+/*
+ * Rollback for Nukkit
+ *
+ * Copyright (C) 2017-2020 boy0001 and larryTheCoder
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package com.boydti.rollback;
 
-import cn.nukkit.Player;
-import cn.nukkit.command.Command;
-import cn.nukkit.command.CommandSender;
-import cn.nukkit.plugin.PluginBase;
-import com.boydti.fawe.config.BBC;
-import com.boydti.rollback.cmd.Wand;
-import com.boydti.rollback.config.Config;
-import com.boydti.rollback.config.Loggers;
-import com.boydti.rollback.config.Storage;
+import cn.nukkit.Server;
+import cn.nukkit.utils.TextFormat;
+import com.boydti.rollback.api.RollbackAPI;
 import com.boydti.rollback.database.DBHandler;
-import com.boydti.rollback.event.PlayerEvents;
-import com.boydti.rollback.listeners.BlockBreak;
-import com.boydti.rollback.listeners.BlockFallListener;
-import com.boydti.rollback.listeners.BlockPlace;
-import com.boydti.rollback.listeners.PhysicsEvent;
-import com.boydti.rollback.we.WELogger;
-import java.io.File;
+import com.boydti.rollback.object.Session;
+import com.boydti.rollback.util.Loggers;
+import com.boydti.rollback.util.TaskManager;
+import com.boydti.rollback.util.Utils;
 
-public class Rollback extends PluginBase {
-    
-    private static Rollback INSTANCE;
+import java.io.File;
+import java.util.HashMap;
+import java.util.Map;
+
+public class Rollback extends RollbackAPI {
+
+    private static final int CONFIG_VERSION = 1;
+
+    private static com.boydti.rollback.Rollback INSTANCE;
+    private final Map<String, Session> playerSession = new HashMap<>();
     private DBHandler db;
+    private String state = "loaded.";
+
+    // Get main instance
+    public static com.boydti.rollback.Rollback get() {
+        return INSTANCE;
+    }
+
+    public DBHandler getDatabase() {
+        return db;
+    }
 
     @Override
     public void onEnable() {
-        INSTANCE = this;
-        
-        Storage.setup(new File(getDataFolder(), "storage.yml"));
-        Config.setup(new File(getDataFolder(), "config.yml"));
-        Loggers.setup(new File(getDataFolder(), "loggers.yml"));
-        
-        // Database
-        db = new DBHandler();
+        Loggers.setup(getConfig());
 
-        // register events
-        new PlayerEvents(this);
-        new BlockBreak(this);
-        new BlockPlace(this);
-        new BlockFallListener(this);
-        new PhysicsEvent(this);
-        new WELogger();
-        getServer().getCommandMap().register("rollback", new Command("rollback") {
-            @Override
-            public boolean execute(CommandSender sender, String label, String[] args) {
-                if (sender instanceof Player) {
-                    new com.boydti.rollback.cmd.Rollback((Player) sender, args);
-                    return true;
-                }
-                return false;
+        // Step 1: Register the database
+        db = new DBHandler(getConfig());
+
+        // Step 2: Register the plugin events
+        new com.boydti.rollback.CoreEvent(this, getConfig().getString("wand-item", "347:0").split(":"));
+
+        // Step 3: Register the plugin command maps
+        getServer().getCommandMap().register("rollback", new com.boydti.rollback.CoreCommand(this));
+
+        // Step 4: Check the players, worlds that been loaded
+        checkStartup();
+        Utils.send(TextFormat.colorize("&aRollback for Nukkit has been " + state));
+    }
+
+    private void checkStartup() {
+        // Sometimes, these could be missed when on reload.
+        Server.getInstance().getLevels().forEach((levelId, level) -> getDatabase().getDatabase(level.getName()));
+        Server.getInstance().getOnlinePlayers().forEach((uuid, player) -> {
+            if (player.hasPermission("rollback.perform")) {
+                Session session = new Session(player);
+
+                setSession(player.getName(), session);
+                Utils.send("&7Created " + player.getName() + "'s Session");
+                state = "reloaded.";
             }
         });
-        Wand wand = new Wand("inspect");
-        getServer().getCommandMap().register("inspect", wand);
-        getServer().getCommandMap().register("rollback:inspect", wand);
-        getServer().getCommandMap().register("??", wand);
-    }
-    
-    // Get main instance
-    public static Rollback get() {
-        return INSTANCE;
-    }
-    
-    // Implementation instace same as main instance
-    public static Rollback imp() {
-        return INSTANCE;
-    }
-    
-    public static DBHandler db() {
-        return INSTANCE.db;
     }
 
-    public static void debug(String m) {
-        m = BBC.color(m);
-        try {
-            get().getServer().getConsoleSender().sendMessage(m);
-        } catch (Exception e) {
-            System.out.println(m.replaceAll("(?i)" + '\u00A7' + "[0-9A-FK-OR]", ""));
+    @Override
+    public void onLoad() {
+        INSTANCE = this;
+
+        if (getResource("config.yml") != null) {
+            saveResource("config.yml");
         }
+
+        // Update the config, ease.
+        File file = new File(getDataFolder(), "config.yml");
+        if (getConfig().getInt("version") < CONFIG_VERSION) {
+            Utils.send("&cOutdated config! Updating to a new one");
+            Utils.send("&aYour old config will be renamed into config.old!");
+            file.renameTo(new File(getDataFolder(), "config.old"));
+            saveResource("config.yml");
+            reloadConfig();
+        }
+
+        // Register TaskManager
+        TaskManager.IMP = new TaskManager();
     }
 
-    public File getDirectory() {
-        return getDataFolder();
+    @Override
+    public Session setSession(String player, Session session) {
+        if (session == null) {
+            playerSession.remove(player);
+            return null;
+        }
+        return playerSession.put(player, session);
+    }
+
+    @Override
+    public Session getSession(String player) {
+        if (playerSession.containsKey(player)) {
+            return playerSession.get(player);
+        }
+
+        Utils.send("&cNo session found for &e" + player + "&c and this is discouraged.");
+        return null;
+    }
+
+    public String getPrefix() {
+        return TextFormat.colorize(getConfig().getString("prefix"));
     }
 }

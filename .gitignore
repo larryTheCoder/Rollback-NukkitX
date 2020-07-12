@@ -54,3 +54,4 @@ build
 bin
 target
 *.bat
+*.txt
