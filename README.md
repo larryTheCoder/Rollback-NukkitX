@@ -1,4 +1,6 @@
 # WIP rollback for MCPE
+[![Jenkins-CI](https://jenkins.potatohome.xyz/job/Rollback%20Nukkit/badge/icon)](https://jenkins.potatohome.xyz/job/Rollback%20Nukkit)
+
 This plugin requires FastAsyncWorldEdit plugin in order to work correctly. Works for NukkitX
 API 1.0.11, MCPE 1.16.x
 
